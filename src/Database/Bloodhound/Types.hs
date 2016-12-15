@@ -1365,7 +1365,7 @@ data Filter = AndFilter [Filter] Cache
             | MissingFilter FieldName Existence NullValue
             | PrefixFilter  FieldName PrefixValue Cache
             | QueryFilter   Query Cache
-            | RangeFilter   FieldName RangeValue RangeExecution Cache
+            | RangeFilter   FieldName RangeValue (Maybe RangeExecution) Cache
             | RegexpFilter  FieldName Regexp RegexpFlags CacheName Cache CacheKey
             | TermFilter    Term Cache
               deriving (Eq, Read, Show, Generic, Typeable)
