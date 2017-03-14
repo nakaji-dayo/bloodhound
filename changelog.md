@@ -1,3 +1,50 @@
+0.12.1.0
+===================
+* @michaelxavier
+  - #162 Allow Aeson 1.1
+* @bermanjosh
+  - #159 Fix bug with tie breaker json instance for MultiMatchQuery
+
+0.12.0.0
+===================
+This release contains several new APIs, documentation fixes, and some minor type updates, and steps towards ES 2.0 support. Thanks to all of our contributors!
+
+* @bermanjosh
+  - #139 Make `nodeOSLoad` record a `Maybe` for Windows compatibility
+  - #138 Change the `nodePluginVersion` record to deal with plugins which report `NA` as their version.
+* @phadej
+  - #155 Shed `derive` dependency in test.
+  - #154 Switch to `Simple` build type.
+  - #153 Loosen deps on aeson, hspec.
+* @andrewthad
+  - #151 Add `waitForYellowIndex`
+* @michaelxavier
+  - #150 Fix some failing QuickCheck tests.
+  - #147 Drop dependency on deprecated doctest-prop.
+  - #137 Add node stats API.
+  - #128 Add nodes API.
+  - #127 Add haddock sections to break up API.
+  - #126 Add snapshot/restore API.
+  - #125 Set lower bound for http-client
+  - #123 Allow replica count of 0 in smart constructor.
+* @23Skidoo
+  - #143 Fix an example.
+  - #142 Docs cleanup.
+* @alistair
+  - #135 Changes date formatting to have leading zeroes to bring us closer to ES 2.0 support.
+  - #133 Fix parent child tests for ES 2.0.
+  - #132 Parse status API from ES 2.0.
+  - #131 Add cardinality aggregations.
+* @dinnu93
+  - #130 Add OverloadedStrings to first example.
+* @MaxGabriel
+  - #117 Fix haddocks italicizing forward slashes.
+
+0.11.1.0
+===================
+* @bitemyapp
+  - Add http-client-0.5.0 support
+
 0.11.0.0
 ===================
 
@@ -79,7 +126,7 @@ Thanks to the following people, Bloodhound 0.8.0.0 is being released!
   - #61: Filter aggregation support
   - #60: Add value_count aggregation support
   - #58: Eliminate partiality in EsResult
-  
+
 * @centromere
   - #59: Fixed bug with IndexSettings serialization
   - #56: Added fields support to Search
@@ -88,7 +135,7 @@ Thanks to the following people, Bloodhound 0.8.0.0 is being released!
   - #52: Added ability to manipulate templates
   - #51: Fixed mapping API
   - #50: Fixed problem with put sending POST
-  
+
 * @bermanjosh
   - #63: Url query encoding bug
   - #53: Scan type

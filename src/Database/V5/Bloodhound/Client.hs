@@ -15,7 +15,7 @@
 --
 -------------------------------------------------------------------------------
 
-module Database.Bloodhound.Client
+module Database.V5.Bloodhound.Client
        ( -- * Bloodhound client functions
          -- | The examples in this module assume the following code has been run.
          --   The :{ and :} will only work in GHCi. You'll only need the data types
@@ -23,32 +23,39 @@ module Database.Bloodhound.Client
 
          -- $setup
          withBH
+       -- ** Indices
        , createIndex
        , deleteIndex
        , updateIndexSettings
        , getIndexSettings
-       , optimizeIndex
+       , forceMergeIndex
        , indexExists
        , openIndex
        , closeIndex
        , listIndices
+       , waitForYellowIndex
+       -- *** Index Aliases
        , updateIndexAliases
        , getIndexAliases
+       -- *** Index Templates
        , putTemplate
        , templateExists
        , deleteTemplate
+       -- ** Mapping
        , putMapping
-       , deleteMapping
+       -- ** Documents
        , indexDocument
        , updateDocument
        , getDocument
        , documentExists
        , deleteDocument
+       -- ** Searching
        , searchAll
        , searchByIndex
        , searchByType
        , scanSearch
        , getInitialScroll
+       , getInitialSortedScroll
        , advanceScroll
        , refreshIndex
        , mkSearch
@@ -59,6 +66,22 @@ module Database.Bloodhound.Client
        , mkShardCount
        , mkReplicaCount
        , getStatus
+       -- ** Snapshot/Restore
+       -- *** Snapshot Repos
+       , getSnapshotRepos
+       , updateSnapshotRepo
+       , verifySnapshotRepo
+       , deleteSnapshotRepo
+       -- *** Snapshots
+       , createSnapshot
+       , getSnapshots
+       , deleteSnapshot
+       -- *** Restoring Snapshots
+       , restoreSnapshot
+       -- ** Nodes
+       , getNodesInfo
+       , getNodesStats
+       -- ** Request Utilities
        , encodeBulkOperations
        , encodeBulkOperation
        -- * Authentication
@@ -72,7 +95,7 @@ module Database.Bloodhound.Client
        where
 
 import qualified Blaze.ByteString.Builder     as BB
-import           Control.Applicative
+import           Control.Applicative          as A
 import           Control.Monad
 import           Control.Monad.Catch
 import           Control.Monad.IO.Class
@@ -98,30 +121,29 @@ import qualified Network.HTTP.Types.URI       as NHTU
 import qualified Network.URI                  as URI
 import           Prelude                      hiding (filter, head)
 
-import           Database.Bloodhound.Types
+import           Database.V5.Bloodhound.Types
 
 -- $setup
 -- >>> :set -XOverloadedStrings
 -- >>> :set -XDeriveGeneric
--- >>> import Database.Bloodhound
--- >>> import Test.DocTest.Prop (assert)
+-- >>> import Database.V5.Bloodhound
 -- >>> let testServer = (Server "http://localhost:9200")
 -- >>> let runBH' = withBH defaultManagerSettings testServer
 -- >>> let testIndex = IndexName "twitter"
 -- >>> let testMapping = MappingName "tweet"
 -- >>> let defaultIndexSettings = IndexSettings (ShardCount 1) (ReplicaCount 0)
 -- >>> data TweetMapping = TweetMapping deriving (Eq, Show)
--- >>> _ <- runBH' $ deleteIndex testIndex >> deleteMapping testIndex testMapping
+-- >>> _ <- runBH' $ deleteIndex testIndex
+-- >>> _ <- runBH' $ deleteIndex (IndexName "didimakeanindex")
 -- >>> import GHC.Generics
 -- >>> import           Data.Time.Calendar        (Day (..))
 -- >>> import Data.Time.Clock (UTCTime (..), secondsToDiffTime)
 -- >>> :{
 --instance ToJSON TweetMapping where
 --          toJSON TweetMapping =
---            object ["tweet" .=
---              object ["properties" .=
---                object ["location" .=
---                  object ["type" .= ("geo_point" :: Text)]]]]
+--            object ["properties" .=
+--              object ["location" .=
+--                object ["type" .= ("geo_point" :: Text)]]]
 --data Location = Location { lat :: Double
 --                         , lon :: Double } deriving (Eq, Generic, Show)
 --data Tweet = Tweet { user     :: Text
@@ -183,7 +205,7 @@ dispatch :: MonadBH m
          -> m Reply
 dispatch dMethod url body = do
   initReq <- liftIO $ parseUrl' url
-  reqHook <- bhRequestHook <$> getBHEnv
+  reqHook <- bhRequestHook A.<$> getBHEnv
   let reqBody = RequestBodyLBS $ fromMaybe emptyBody body
   req <- liftIO $ reqHook $ setRequestIgnoreStatus $ initReq { method = dMethod
                                                              , requestBody = reqBody }
@@ -203,12 +225,8 @@ appendSearchTypeParam originalUrl st = addQuery params originalUrl
   where stText = "search_type"
         params
           | st == SearchTypeDfsQueryThenFetch = [(stText, Just "dfs_query_then_fetch")]
-          | st == SearchTypeCount             = [(stText, Just "count")]
-          | st == SearchTypeScan              = [(stText, Just "scan"), ("scroll", Just "1m")]
-          | st == SearchTypeQueryAndFetch     = [(stText, Just "query_and_fetch")]
-          | st == SearchTypeDfsQueryAndFetch  = [(stText, Just "dfs_query_and_fetch")]
         -- used to catch 'SearchTypeQueryThenFetch', which is also the default
-          | otherwise                         = [(stText, Just "query_then_fetch")]
+          | otherwise                         = []
 
 -- | Severely dumbed down query renderer. Assumes your data doesn't
 -- need any encoding
@@ -252,13 +270,225 @@ post   = dispatch NHTM.methodPost
 -- | 'getStatus' fetches the 'Status' of a 'Server'
 --
 -- >>> serverStatus <- runBH' getStatus
--- >>> fmap status (serverStatus)
--- Just 200
+-- >>> fmap tagline (serverStatus)
+-- Just "You Know, for Search"
 getStatus :: MonadBH m => m (Maybe Status)
 getStatus = do
   response <- get =<< url
   return $ decode (responseBody response)
   where url = joinPath []
+
+-- | 'getSnapshotRepos' gets the definitions of a subset of the
+-- defined snapshot repos.
+getSnapshotRepos
+    :: ( MonadBH m
+       , MonadThrow m
+       )
+    => SnapshotRepoSelection
+    -> m (Either EsError [GenericSnapshotRepo])
+getSnapshotRepos sel = fmap (fmap unGSRs) . parseEsResponse =<< get =<< url
+  where
+    url = joinPath ["_snapshot", selectorSeg]
+    selectorSeg = case sel of
+                    AllSnapshotRepos -> "_all"
+                    SnapshotRepoList (p :| ps) -> T.intercalate "," (renderPat <$> (p:ps))
+    renderPat (RepoPattern t)                  = t
+    renderPat (ExactRepo (SnapshotRepoName t)) = t
+
+
+-- | Wrapper to extract the list of 'GenericSnapshotRepo' in the
+-- format they're returned in
+newtype GSRs = GSRs { unGSRs :: [GenericSnapshotRepo] }
+
+
+instance FromJSON GSRs where
+  parseJSON = withObject "Collection of GenericSnapshotRepo" parse
+    where
+      parse = fmap GSRs . mapM (uncurry go) . HM.toList
+      go rawName = withObject "GenericSnapshotRepo" $ \o -> do
+        GenericSnapshotRepo (SnapshotRepoName rawName) <$> o .: "type"
+                                                       <*> o .: "settings"
+
+
+-- | Create or update a snapshot repo
+updateSnapshotRepo
+  :: ( MonadBH m
+     , SnapshotRepo repo
+     )
+  => SnapshotRepoUpdateSettings
+  -- ^ Use 'defaultSnapshotRepoUpdateSettings' if unsure
+  -> repo
+  -> m Reply
+updateSnapshotRepo SnapshotRepoUpdateSettings {..} repo =
+  bindM2 put url (return (Just body))
+  where
+    url = addQuery params <$> joinPath ["_snapshot", snapshotRepoName gSnapshotRepoName]
+    params
+      | repoUpdateVerify = []
+      | otherwise        = [("verify", Just "false")]
+    body = encode $ object [ "type" .= gSnapshotRepoType
+                           , "settings" .= gSnapshotRepoSettings
+                           ]
+    GenericSnapshotRepo {..} = toGSnapshotRepo repo
+
+
+
+-- | Verify if a snapshot repo is working. __NOTE:__ this API did not
+-- make it into ElasticSearch until 1.4. If you use an older version,
+-- you will get an error here.
+verifySnapshotRepo
+    :: ( MonadBH m
+       , MonadThrow m
+       )
+    => SnapshotRepoName
+    -> m (Either EsError SnapshotVerification)
+verifySnapshotRepo (SnapshotRepoName n) =
+  parseEsResponse =<< bindM2 post url (return Nothing)
+  where
+    url = joinPath ["_snapshot", n, "_verify"]
+
+
+deleteSnapshotRepo :: MonadBH m => SnapshotRepoName -> m Reply
+deleteSnapshotRepo (SnapshotRepoName n) = delete =<< url
+  where
+    url = joinPath ["_snapshot", n]
+
+
+-- | Create and start a snapshot
+createSnapshot
+    :: (MonadBH m)
+    => SnapshotRepoName
+    -> SnapshotName
+    -> SnapshotCreateSettings
+    -> m Reply
+createSnapshot (SnapshotRepoName repoName)
+               (SnapshotName snapName)
+               SnapshotCreateSettings {..} =
+  bindM2 put url (return (Just body))
+  where
+    url = addQuery params <$> joinPath ["_snapshot", repoName, snapName]
+    params = [("wait_for_completion", Just (boolQP snapWaitForCompletion))]
+    body = encode $ object prs
+    prs = catMaybes [ ("indices" .=) . indexSelectionName <$> snapIndices
+                    , Just ("ignore_unavailable" .= snapIgnoreUnavailable)
+                    , Just ("ignore_global_state" .= snapIncludeGlobalState)
+                    , Just ("partial" .= snapPartial)
+                    ]
+
+
+indexSelectionName :: IndexSelection -> Text
+indexSelectionName AllIndexes            = "_all"
+indexSelectionName (IndexList (i :| is)) = T.intercalate "," (renderIndex <$> (i:is))
+  where
+    renderIndex (IndexName n) = n
+
+
+-- | Get info about known snapshots given a pattern and repo name.
+getSnapshots
+    :: ( MonadBH m
+       , MonadThrow m
+       )
+    => SnapshotRepoName
+    -> SnapshotSelection
+    -> m (Either EsError [SnapshotInfo])
+getSnapshots (SnapshotRepoName repoName) sel =
+  fmap (fmap unSIs) . parseEsResponse =<< get =<< url
+  where
+    url = joinPath ["_snapshot", repoName, snapPath]
+    snapPath = case sel of
+      AllSnapshots -> "_all"
+      SnapshotList (s :| ss) -> T.intercalate "," (renderPath <$> (s:ss))
+    renderPath (SnapPattern t)              = t
+    renderPath (ExactSnap (SnapshotName t)) = t
+
+
+newtype SIs = SIs { unSIs :: [SnapshotInfo] }
+
+
+instance FromJSON SIs where
+  parseJSON = withObject "Collection of SnapshotInfo" parse
+    where
+      parse o = SIs <$> o .: "snapshots"
+
+
+-- | Delete a snapshot. Cancels if it is running.
+deleteSnapshot :: MonadBH m => SnapshotRepoName -> SnapshotName -> m Reply
+deleteSnapshot (SnapshotRepoName repoName) (SnapshotName snapName) =
+  delete =<< url
+  where
+    url = joinPath ["_snapshot", repoName, snapName]
+
+
+-- | Restore a snapshot to the cluster See
+-- <https://www.elastic.co/guide/en/elasticsearch/reference/1.7/modules-snapshots.html#_restore>
+-- for more details.
+restoreSnapshot
+    :: MonadBH m
+    => SnapshotRepoName
+    -> SnapshotName
+    -> SnapshotRestoreSettings
+    -- ^ Start with 'defaultSnapshotRestoreSettings' and customize
+    -- from there for reasonable defaults.
+    -> m Reply
+restoreSnapshot (SnapshotRepoName repoName)
+                (SnapshotName snapName)
+                SnapshotRestoreSettings {..} = bindM2 post url (return (Just body))
+  where
+    url = addQuery params <$> joinPath ["_snapshot", repoName, snapName, "_restore"]
+    params = [("wait_for_completion", Just (boolQP snapRestoreWaitForCompletion))]
+    body = encode (object prs)
+
+
+    prs = catMaybes [ ("indices" .=) . indexSelectionName <$> snapRestoreIndices
+                 , Just ("ignore_unavailable" .= snapRestoreIgnoreUnavailable)
+                 , Just ("include_global_state" .= snapRestoreIncludeGlobalState)
+                 , ("rename_pattern" .=) <$> snapRestoreRenamePattern
+                 , ("rename_replacement" .=) . renderTokens <$> snapRestoreRenameReplacement
+                 , Just ("include_aliases" .= snapRestoreIncludeAliases)
+                 , ("index_settings" .= ) <$> snapRestoreIndexSettingsOverrides
+                 , ("ignore_index_settings" .= ) <$> snapRestoreIgnoreIndexSettings
+                 ]
+    renderTokens (t :| ts) = mconcat (renderToken <$> (t:ts))
+    renderToken (RRTLit t)      = t
+    renderToken RRSubWholeMatch = "$0"
+    renderToken (RRSubGroup g)  = T.pack (show (rrGroupRefNum g))
+
+
+getNodesInfo
+    :: ( MonadBH m
+       , MonadThrow m
+       )
+    => NodeSelection
+    -> m (Either EsError NodesInfo)
+getNodesInfo sel = parseEsResponse =<< get =<< url
+  where
+    url = joinPath ["_nodes", selectionSeg]
+    selectionSeg = case sel of
+      LocalNode -> "_local"
+      NodeList (l :| ls) -> T.intercalate "," (selToSeg <$> (l:ls))
+      AllNodes -> "_all"
+    selToSeg (NodeByName (NodeName n))            = n
+    selToSeg (NodeByFullNodeId (FullNodeId i))    = i
+    selToSeg (NodeByHost (Server s))              = s
+    selToSeg (NodeByAttribute (NodeAttrName a) v) = a <> ":" <> v
+
+getNodesStats
+    :: ( MonadBH m
+       , MonadThrow m
+       )
+    => NodeSelection
+    -> m (Either EsError NodesStats)
+getNodesStats sel = parseEsResponse =<< get =<< url
+  where
+    url = joinPath ["_nodes", selectionSeg, "stats"]
+    selectionSeg = case sel of
+      LocalNode -> "_local"
+      NodeList (l :| ls) -> T.intercalate "," (selToSeg <$> (l:ls))
+      AllNodes -> "_all"
+    selToSeg (NodeByName (NodeName n))            = n
+    selToSeg (NodeByFullNodeId (FullNodeId i))    = i
+    selToSeg (NodeByHost (Server s))              = s
+    selToSeg (NodeByAttribute (NodeAttrName a) v) = a <> ":" <> v
 
 -- | 'createIndex' will create an index given a 'Server', 'IndexSettings', and an 'IndexName'.
 --
@@ -280,7 +510,7 @@ createIndex indexSettings (IndexName indexName) =
 -- >>> response <- runBH' $ deleteIndex (IndexName "didimakeanindex")
 -- >>> respIsTwoHunna response
 -- True
--- >>> runBH' $ indexExists testIndex
+-- >>> runBH' $ indexExists (IndexName "didimakeanindex")
 -- False
 deleteIndex :: MonadBH m => IndexName -> m Reply
 deleteIndex (IndexName indexName) =
@@ -307,47 +537,43 @@ getIndexSettings (IndexName indexName) = do
   where url = joinPath [indexName, "_settings"]
 
 
--- | 'optimizeIndex' will optimize a single index, list of indexes or
--- all indexes. Note that this call will block until finishing but
--- will continue even if the request times out. Concurrent requests to
--- optimize an index while another is performing will block until the
--- previous one finishes. For more information see
--- <https://www.elastic.co/guide/en/elasticsearch/reference/1.7/indices-optimize.html>. Nothing
+-- | 'forceMergeIndex' 
+-- 
+-- The force merge API allows to force merging of one or more indices through
+-- an API. The merge relates to the number of segments a Lucene index holds
+-- within each shard. The force merge operation allows to reduce the number of
+-- segments by merging them.
+--
+-- This call will block until the merge is complete. If the http connection is
+-- lost, the request will continue in the background, and any new requests will
+-- block until the previous force merge is complete.
+
+-- For more information see
+-- <https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-forcemerge.html#indices-forcemerge>.
+-- Nothing
 -- worthwhile comes back in the reply body, so matching on the status
 -- should suffice.
 --
--- 'optimizeIndex' with a maxNumSegments of 1 and onlyExpungeDeletes
+-- 'forceMergeIndex' with a maxNumSegments of 1 and onlyExpungeDeletes
 -- to True is the main way to release disk space back to the OS being
 -- held by deleted documents.
 --
--- Note that this API was deprecated in ElasticSearch 2.1 for the
--- almost completely identical forcemerge API. Adding support to that
--- API would be trivial but due to the significant breaking changes,
--- this library cannot currently be used with >= 2.0, so that feature was omitted.
---
 -- >>> let ixn = IndexName "unoptimizedindex"
 -- >>> _ <- runBH' $ deleteIndex ixn >> createIndex defaultIndexSettings ixn
--- >>> response <- runBH' $ optimizeIndex (IndexList (ixn :| [])) (defaultIndexOptimizationSettings { maxNumSegments = Just 1, onlyExpungeDeletes = True })
+-- >>> response <- runBH' $ forceMergeIndex (IndexList (ixn :| [])) (defaultIndexOptimizationSettings { maxNumSegments = Just 1, onlyExpungeDeletes = True })
 -- >>> respIsTwoHunna response
 -- True
-optimizeIndex :: MonadBH m => IndexSelection -> IndexOptimizationSettings -> m Reply
-optimizeIndex ixs IndexOptimizationSettings {..} =
+forceMergeIndex :: MonadBH m => IndexSelection -> ForceMergeIndexSettings -> m Reply
+forceMergeIndex ixs ForceMergeIndexSettings {..} =
     bindM2 post url (return body)
-  where url = addQuery params <$> joinPath [indexName, "_optimize"]
+  where url = addQuery params <$> joinPath [indexName, "_forcemerge"]
         params = catMaybes [ ("max_num_segments",) . Just . showText <$> maxNumSegments
                            , Just ("only_expunge_deletes", Just (boolQP onlyExpungeDeletes))
                            , Just ("flush", Just (boolQP flushAfterOptimize))
                            ]
         indexName = indexSelectionName ixs
-        boolQP True = "true"
-        boolQP False = "false"
         body = Nothing
 
-
--------------------------------------------------------------------------------
-indexSelectionName :: IndexSelection -> Text
-indexSelectionName (IndexList names) = T.intercalate "," [n | IndexName n <- toList names]
-indexSelectionName AllIndexes        = "_all"
 
 deepMerge :: [Object] -> Object
 deepMerge = LS.foldl' go mempty
@@ -407,6 +633,14 @@ refreshIndex :: MonadBH m => IndexName -> m Reply
 refreshIndex (IndexName indexName) =
   bindM2 post url (return Nothing)
   where url = joinPath [indexName, "_refresh"]
+
+-- | Block until the index becomes available for indexing
+--   documents. This is useful for integration tests in which
+--   indices are rapidly created and deleted.
+waitForYellowIndex :: MonadBH m => IndexName -> m Reply
+waitForYellowIndex (IndexName indexName) = get =<< url
+  where url = addQuery q <$> joinPath ["_cluster","health",indexName]
+        q = [("wait_for_status",Just "yellow"),("timeout",Just "10s")]
 
 stringifyOCIndex :: OpenCloseIndex -> Text
 stringifyOCIndex oci = case oci of
@@ -511,7 +745,7 @@ deleteTemplate (TemplateName templateName) =
 -- >>> _ <- runBH' $ createIndex defaultIndexSettings testIndex
 -- >>> resp <- runBH' $ putMapping testIndex testMapping TweetMapping
 -- >>> print resp
--- Response {responseStatus = Status {statusCode = 200, statusMessage = "OK"}, responseVersion = HTTP/1.1, responseHeaders = [("Content-Type","application/json; charset=UTF-8"),("Content-Length","21")], responseBody = "{\"acknowledged\":true}", responseCookieJar = CJ {expose = []}, responseClose' = ResponseClose}
+-- Response {responseStatus = Status {statusCode = 200, statusMessage = "OK"}, responseVersion = HTTP/1.1, responseHeaders = [("content-type","application/json; charset=UTF-8"),("content-encoding","gzip"),("transfer-encoding","chunked")], responseBody = "{\"acknowledged\":true}", responseCookieJar = CJ {expose = []}, responseClose' = ResponseClose}
 putMapping :: (MonadBH m, ToJSON a) => IndexName
                  -> MappingName -> a -> m Reply
 putMapping (IndexName indexName) (MappingName mappingName) mapping =
@@ -520,21 +754,6 @@ putMapping (IndexName indexName) (MappingName mappingName) mapping =
         -- "_mapping" and mappingName above were originally transposed
         -- erroneously. The correct API call is: "/INDEX/_mapping/MAPPING_NAME"
         body = Just $ encode mapping
-
--- | 'deleteMapping' is an HTTP DELETE and deletes a mapping for a given index.
--- Mappings are schemas for documents in indexes.
---
--- >>> _ <- runBH' $ createIndex defaultIndexSettings testIndex
--- >>> _ <- runBH' $ putMapping testIndex testMapping TweetMapping
--- >>> resp <- runBH' $ deleteMapping testIndex testMapping
--- >>> print resp
--- Response {responseStatus = Status {statusCode = 200, statusMessage = "OK"}, responseVersion = HTTP/1.1, responseHeaders = [("Content-Type","application/json; charset=UTF-8"),("Content-Length","21")], responseBody = "{\"acknowledged\":true}", responseCookieJar = CJ {expose = []}, responseClose' = ResponseClose}
-deleteMapping :: MonadBH m => IndexName -> MappingName -> m Reply
-deleteMapping (IndexName indexName)
-  (MappingName mappingName) =
-  -- "_mapping" and mappingName below were originally transposed
-  -- erroneously. The correct API call is: "/INDEX/_mapping/MAPPING_NAME"
-  delete =<< joinPath [indexName, "_mapping", mappingName]
 
 versionCtlParams :: IndexDocumentSettings -> [(Text, Maybe Text)]
 versionCtlParams cfg =
@@ -557,7 +776,7 @@ versionCtlParams cfg =
 --
 -- >>> resp <- runBH' $ indexDocument testIndex testMapping defaultIndexDocumentSettings exampleTweet (DocId "1")
 -- >>> print resp
--- Response {responseStatus = Status {statusCode = 201, statusMessage = "Created"}, responseVersion = HTTP/1.1, responseHeaders = [("Content-Type","application/json; charset=UTF-8"),("Content-Length","74")], responseBody = "{\"_index\":\"twitter\",\"_type\":\"tweet\",\"_id\":\"1\",\"_version\":1,\"created\":true}", responseCookieJar = CJ {expose = []}, responseClose' = ResponseClose}
+-- Response {responseStatus = Status {statusCode = 201, statusMessage = "Created"}, responseVersion = HTTP/1.1, responseHeaders = [("Location","/twitter/tweet/1"),("content-type","application/json; charset=UTF-8"),("content-encoding","gzip"),("transfer-encoding","chunked")], responseBody = "{\"_index\":\"twitter\",\"_type\":\"tweet\",\"_id\":\"1\",\"_version\":1,\"result\":\"created\",\"_shards\":{\"total\":2,\"successful\":1,\"failed\":0},\"created\":true}", responseCookieJar = CJ {expose = []}, responseClose' = ResponseClose}
 indexDocument :: (ToJSON doc, MonadBH m) => IndexName -> MappingName
                  -> IndexDocumentSettings -> doc -> DocId -> m Reply
 indexDocument (IndexName indexName)
@@ -720,20 +939,40 @@ searchByType (IndexName indexName)
   (MappingName mappingName) = bindM2 dispatchSearch url . return
   where url = joinPath [indexName, mappingName, "_search"]
 
--- | For a given scearch, request a scroll for efficient streaming of
+-- | For a given search, request a scroll for efficient streaming of
 -- search results. Note that the search is put into 'SearchTypeScan'
 -- mode and thus results will not be sorted. Combine this with
 -- 'advanceScroll' to efficiently stream through the full result set
-getInitialScroll :: MonadBH m => IndexName -> MappingName -> Search -> m (Maybe ScrollId)
-getInitialScroll (IndexName indexName) (MappingName mappingName) search = do
-    let url = joinPath [indexName, mappingName, "_search"]
-        search' = search { searchType = SearchTypeScan }
-    resp' <- bindM2 dispatchSearch url (return search')
-    let msr = decode' $ responseBody resp' :: Maybe (SearchResult ())
-        msid = maybe Nothing scrollId msr
-    return msid
+getInitialScroll :: 
+  (FromJSON a, MonadThrow m, MonadBH m) => IndexName -> 
+                                           MappingName -> 
+                                           Search -> 
+                                           m (Either EsError (SearchResult a))
+getInitialScroll (IndexName indexName) (MappingName mappingName) search' = do
+    let url = addQuery params <$> joinPath [indexName, mappingName, "_search"]
+        params = [("scroll", Just "1m")]
+        sorting = Just [DefaultSortSpec $ mkSort (FieldName "_doc") Descending]
+        search = search' { sortBody = sorting }
+    resp' <- bindM2 dispatchSearch url (return search)
+    parseEsResponse resp'
 
-scroll' :: (FromJSON a, MonadBH m, MonadThrow m) => Maybe ScrollId -> m ([Hit a], Maybe ScrollId)
+-- | For a given search, request a scroll for efficient streaming of
+-- search results. Combine this with 'advanceScroll' to efficiently
+-- stream through the full result set. Note that this search respects
+-- sorting and may be less efficient than 'getInitialScroll'.
+getInitialSortedScroll ::
+  (FromJSON a, MonadThrow m, MonadBH m) => IndexName ->
+                                           MappingName ->
+                                           Search ->
+                                           m (Either EsError (SearchResult a))
+getInitialSortedScroll (IndexName indexName) (MappingName mappingName) search = do
+    let url = addQuery params <$> joinPath [indexName, mappingName, "_search"]
+        params = [("scroll", Just "1m")]
+    resp' <- bindM2 dispatchSearch url (return search)
+    parseEsResponse resp'
+
+scroll' :: (FromJSON a, MonadBH m, MonadThrow m) => Maybe ScrollId -> 
+                                                    m ([Hit a], Maybe ScrollId)
 scroll' Nothing = return ([], Nothing)
 scroll' (Just sid) = do
     res <- advanceScroll sid 60
@@ -753,20 +992,29 @@ advanceScroll
   -- ^ How long should the snapshot of data be kept around? This timeout is updated every time 'advanceScroll' is used, so don't feel the need to set it to the entire duration of your search processing. Note that durations < 1s will be rounded up. Also note that 'NominalDiffTime' is an instance of Num so literals like 60 will be interpreted as seconds. 60s is a reasonable default.
   -> m (Either EsError (SearchResult a))
 advanceScroll (ScrollId sid) scroll = do
-  url <- joinPath ["_search/scroll?scroll=" <> scrollTime]
-  parseEsResponse =<< post url (Just . L.fromStrict $ T.encodeUtf8 sid)
+  url <- joinPath ["_search", "scroll"]
+  resp <- post url (Just $ encode scrollObject)
+  parseEsResponse resp
   where scrollTime = showText secs <> "s"
         secs :: Integer
         secs = round scroll
+        
+        scrollObject = object [ "scroll" .= scrollTime
+                              , "scroll_id" .= sid
+                              ]
 
-simpleAccumulator :: (FromJSON a, MonadBH m, MonadThrow m) => [Hit a] -> ([Hit a], Maybe ScrollId) -> m ([Hit a], Maybe ScrollId)
+simpleAccumulator :: 
+  (FromJSON a, MonadBH m, MonadThrow m) => 
+                                [Hit a] ->
+                                ([Hit a], Maybe ScrollId) ->
+                                m ([Hit a], Maybe ScrollId)
 simpleAccumulator oldHits (newHits, Nothing) = return (oldHits ++ newHits, Nothing)
 simpleAccumulator oldHits ([], _) = return (oldHits, Nothing)
 simpleAccumulator oldHits (newHits, msid) = do
     (newHits', msid') <- scroll' msid
     simpleAccumulator (oldHits ++ newHits) (newHits', msid')
 
--- | 'scanSearch' uses the 'scan&scroll' API of elastic,
+-- | 'scanSearch' uses the 'scroll' API of elastic,
 -- for a given 'IndexName' and 'MappingName'. Note that this will
 -- consume the entire search result set and will be doing O(n) list
 -- appends so this may not be suitable for large result sets. In that
@@ -775,11 +1023,16 @@ simpleAccumulator oldHits (newHits, msid) = do
 -- pipes, or your favorite streaming IO abstraction of choice. Note
 -- that ordering on the search would destroy performance and thus is
 -- ignored.
-scanSearch :: (FromJSON a, MonadBH m, MonadThrow m) => IndexName -> MappingName -> Search -> m [Hit a]
+scanSearch :: (FromJSON a, MonadBH m, MonadThrow m) => IndexName
+                                                    -> MappingName
+                                                    -> Search
+                                                    -> m [Hit a]
 scanSearch indexName mappingName search = do
-    msid <- getInitialScroll indexName mappingName search
-    (hits, msid') <- scroll' msid
-    (totalHits, _) <- simpleAccumulator [] (hits, msid')
+    initialSearchResult <- getInitialScroll indexName mappingName search
+    let (hits', josh) = case initialSearchResult of
+                          Right SearchResult {..} -> (hits searchHits, scrollId)
+                          Left _ -> ([], Nothing)
+    (totalHits, _) <- simpleAccumulator [] (hits', josh)
     return totalHits
 
 -- | 'mkSearch' is a helper function for defaulting additional fields of a 'Search'
@@ -856,3 +1109,8 @@ basicAuthHook :: Monad m => EsUsername -> EsPassword -> Request -> m Request
 basicAuthHook (EsUsername u) (EsPassword p) = return . applyBasicAuth u' p'
   where u' = T.encodeUtf8 u
         p' = T.encodeUtf8 p
+
+
+boolQP :: Bool -> Text
+boolQP True  = "true"
+boolQP False = "false"

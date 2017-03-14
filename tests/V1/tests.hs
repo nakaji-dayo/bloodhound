@@ -1,23 +1,28 @@
+{-# LANGUAGE CPP                        #-}
 {-# LANGUAGE DefaultSignatures          #-}
+{-# LANGUAGE DeriveDataTypeable         #-}
 {-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
-{-# LANGUAGE TemplateHaskell            #-}
 {-# LANGUAGE TypeOperators              #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+#if __GLASGOW_HASKELL__ < 800
+{-# OPTIONS_GHC -fcontext-stack=100 #-}
+#endif
 module Main where
 
 import           Control.Applicative
 import           Control.Error
-import           Control.Exception
+import           Control.Exception               (evaluate)
 import           Control.Monad
+import           Control.Monad.Catch
 import           Control.Monad.Reader
 import           Data.Aeson
 import           Data.Aeson.Types                (parseEither)
 import qualified Data.ByteString.Lazy.Char8      as BL8
-import           Data.DeriveTH
 import qualified Data.HashMap.Strict             as HM
 import           Data.List                       (nub)
 import qualified Data.List                       as L
@@ -25,6 +30,7 @@ import           Data.List.NonEmpty              (NonEmpty (..))
 import qualified Data.List.NonEmpty              as NE
 import qualified Data.Map.Strict                 as M
 import           Data.Monoid
+import           Data.Ord                        (comparing)
 import           Data.Proxy
 import           Data.Text                       (Text)
 import qualified Data.Text                       as T
@@ -33,16 +39,24 @@ import           Data.Time.Clock                 (NominalDiffTime, UTCTime (..),
                                                   secondsToDiffTime)
 import           Data.Typeable
 import qualified Data.Vector                     as V
-import           Database.Bloodhound
+import qualified Data.Version                    as Vers
+import           Database.V1.Bloodhound
 import           GHC.Generics                    as G
 import           Network.HTTP.Client             hiding (Proxy)
+import qualified Network.HTTP.Types.Method       as NHTM
 import qualified Network.HTTP.Types.Status       as NHTS
+import qualified Network.URI                     as URI
 import           Prelude                         hiding (filter)
+import           System.IO.Temp
+import           System.PosixCompat.Files
 import           Test.Hspec
 import           Test.QuickCheck.Property.Monoid (T (..), eq, prop_Monoid)
 
 import           Test.Hspec.QuickCheck           (prop)
 import           Test.QuickCheck
+
+import qualified Generics.SOP as SOP
+import qualified Generics.SOP.GGP as SOP
 
 testServer  :: Server
 testServer  = Server "http://localhost:9200"
@@ -54,61 +68,87 @@ testMapping = MappingName "tweet"
 withTestEnv :: BH IO a -> IO a
 withTestEnv = withBH defaultManagerSettings testServer
 
-validateStatus :: Response body -> Int -> Expectation
+validateStatus :: Show body => Response body -> Int -> Expectation
 validateStatus resp expected =
-  (NHTS.statusCode $ responseStatus resp)
-  `shouldBe` (expected :: Int)
+  if actual == expected
+    then return ()
+    else expectationFailure ("Expected " <> show expected <> " but got " <> show actual <> ": " <> show body)
+  where
+    actual = NHTS.statusCode (responseStatus resp)
+    body = responseBody resp
 
-createExampleIndex :: BH IO Reply
+createExampleIndex :: (MonadBH m) => m Reply
 createExampleIndex = createIndex (IndexSettings (ShardCount 1) (ReplicaCount 0)) testIndex
-deleteExampleIndex :: BH IO Reply
+deleteExampleIndex :: (MonadBH m) => m Reply
 deleteExampleIndex = deleteIndex testIndex
 
-data ServerVersion = ServerVersion Int Int Int deriving (Show, Eq, Ord)
+es13 :: Vers.Version
+es13 = Vers.Version [1, 3, 0] []
 
-es13 :: ServerVersion
-es13 = ServerVersion 1 3 0
+es12 :: Vers.Version
+es12 = Vers.Version [1, 2, 0] []
 
-es12 :: ServerVersion
-es12 = ServerVersion 1 2 0
+es11 :: Vers.Version
+es11 = Vers.Version [1, 1, 0] []
 
-es11 :: ServerVersion
-es11 = ServerVersion 1 1 0
+es14 :: Vers.Version
+es14 = Vers.Version [1, 4, 0] []
 
-serverBranch :: ServerVersion -> ServerVersion
-serverBranch (ServerVersion majorVer minorVer patchVer) =
-  ServerVersion majorVer minorVer patchVer
+es15 :: Vers.Version
+es15 = Vers.Version [1, 5, 0] []
 
-mkServerVersion :: [Int] -> Maybe ServerVersion
-mkServerVersion [majorVer, minorVer, patchVer] =
-  Just (ServerVersion majorVer minorVer patchVer)
-mkServerVersion _                 = Nothing
+es16 :: Vers.Version
+es16 = Vers.Version [1, 6, 0] []
 
-getServerVersion :: IO (Maybe ServerVersion)
-getServerVersion = liftM extractVersion (withTestEnv getStatus)
+es20 :: Vers.Version
+es20 = Vers.Version [2, 0, 0] []
+
+getServerVersion :: IO (Maybe Vers.Version)
+getServerVersion = fmap extractVersion <$> withTestEnv getStatus
   where
-    version'                    = T.splitOn "." . number . version
-    toInt                       = read . T.unpack
-    parseVersion v              = map toInt (version' v)
-    extractVersion              = join . liftM (mkServerVersion . parseVersion)
+    extractVersion              = versionNumber . number . version
 
-testServerBranch :: IO (Maybe ServerVersion)
-testServerBranch = getServerVersion >>= \v -> return $ liftM serverBranch v
+-- | Get configured repo paths for snapshotting. Note that by default
+-- this is not enabled and if we are over es 1.5, we won't be able to
+-- test snapshotting. Note that this can and should be part of the
+-- client functionality in a much less ad-hoc incarnation.
+getRepoPaths :: IO [FilePath]
+getRepoPaths = withTestEnv $ do
+  bhe <- getBHEnv
+  let Server s = bhServer bhe
+  let tUrl = s <> "/" <> "_nodes"
+  initReq <- parseRequest (URI.escapeURIString URI.isAllowedInURI (T.unpack tUrl))
+  let req = setRequestIgnoreStatus $ initReq { method = NHTM.methodGet }
+  Right (Object o) <- parseEsResponse =<< liftIO (httpLbs req (bhManager bhe))
+  return $ fromMaybe mempty $ do
+    Object nodes <- HM.lookup "nodes" o
+    Object firstNode <- snd <$> headMay (HM.toList nodes)
+    Object settings <- HM.lookup "settings" firstNode
+    Object path <- HM.lookup "path" settings
+    Array repo <- HM.lookup "repo" path
+    return [ T.unpack t | String t <- V.toList repo]
 
-atleast :: ServerVersion -> IO Bool
-atleast v = testServerBranch >>= \x -> return $ x >= Just (serverBranch v)
+-- | 1.5 and earlier don't care about repo paths
+canSnapshot :: IO Bool
+canSnapshot = do
+  caresAboutRepos <- atleast es16
+  repoPaths <- getRepoPaths
+  return (not caresAboutRepos || not (null (repoPaths)))
 
-atmost :: ServerVersion -> IO Bool
-atmost v = testServerBranch >>= \x -> return $ x <= Just (serverBranch v)
+atleast :: Vers.Version -> IO Bool
+atleast v = getServerVersion >>= \x -> return $ x >= Just v
 
-is :: ServerVersion -> IO Bool
-is v = testServerBranch >>= \x -> return $ x == Just (serverBranch v)
+atmost :: Vers.Version -> IO Bool
+atmost v = getServerVersion >>= \x -> return $ x <= Just v
+
+is :: Vers.Version -> IO Bool
+is v = getServerVersion >>= \x -> return $ x == Just v
 
 when' :: Monad m => m Bool -> m () -> m ()
 when' b f = b >>= \x -> when x f
 
-(==~) :: (ApproxEq a, Show a) => a -> a -> Property
-a ==~ b = counterexample (show a ++ " !=~ " ++ show b) (a =~ b)
+(==~) :: (ApproxEq a) => a -> a -> Property
+a ==~ b = counterexample (showApproxEq a ++ " !=~ " ++ showApproxEq b) (a =~ b)
 
 propJSON :: forall a. (Arbitrary a, ToJSON a, FromJSON a, Show a, ApproxEq a, Typeable a) => Proxy a -> Spec
 propJSON _ = prop testName $ \(a :: a) ->
@@ -141,30 +181,44 @@ data ParentMapping = ParentMapping deriving (Eq, Show)
 
 instance ToJSON ParentMapping where
   toJSON ParentMapping =
-    object ["parent" .= Null ]
+    object ["properties" .=
+      object [ "user"     .= object ["type"    .= ("string" :: Text)]
+            -- Serializing the date as a date is breaking other tests, mysteriously.
+            -- , "postDate" .= object [ "type"   .= ("date" :: Text)
+            --                        , "format" .= ("YYYY-MM-dd`T`HH:mm:ss.SSSZZ" :: Text)]
+            , "message"  .= object ["type" .= ("string" :: Text)]
+            , "age"      .= object ["type" .= ("integer" :: Text)]
+            , "location" .= object ["type" .= ("geo_point" :: Text)]
+            ]]
 
 data ChildMapping = ChildMapping deriving (Eq, Show)
 
 instance ToJSON ChildMapping where
   toJSON ChildMapping =
-    object ["child" .=
-      object ["_parent" .= object ["type" .= ("parent" :: Text)]]
-    ]
+    object ["_parent" .= object ["type" .= ("parent" :: Text)]
+           , "properties" .=
+                object [ "user"     .= object ["type"    .= ("string" :: Text)]
+                  -- Serializing the date as a date is breaking other tests, mysteriously.
+                  -- , "postDate" .= object [ "type"   .= ("date" :: Text)
+                  --                        , "format" .= ("YYYY-MM-dd`T`HH:mm:ss.SSSZZ" :: Text)]
+                  , "message"  .= object ["type" .= ("string" :: Text)]
+                  , "age"      .= object ["type" .= ("integer" :: Text)]
+                  , "location" .= object ["type" .= ("geo_point" :: Text)]
+                  ]]
 
 data TweetMapping = TweetMapping deriving (Eq, Show)
 
 instance ToJSON TweetMapping where
   toJSON TweetMapping =
-    object ["tweet" .=
-      object ["properties" .=
-        object [ "user"     .= object ["type"    .= ("string" :: Text)]
-               -- Serializing the date as a date is breaking other tests, mysteriously.
-               -- , "postDate" .= object [ "type"   .= ("date" :: Text)
-               --                        , "format" .= ("YYYY-MM-dd`T`HH:mm:ss.SSSZZ" :: Text)]
-               , "message"  .= object ["type" .= ("string" :: Text)]
-               , "age"      .= object ["type" .= ("integer" :: Text)]
-               , "location" .= object ["type" .= ("geo_point" :: Text)]
-               ]]]
+    object ["properties" .=
+      object [ "user"     .= object ["type"    .= ("string" :: Text)]
+             -- Serializing the date as a date is breaking other tests, mysteriously.
+             -- , "postDate" .= object [ "type"   .= ("date" :: Text)
+             --                        , "format" .= ("YYYY-MM-dd`T`HH:mm:ss.SSSZZ" :: Text)]
+             , "message"  .= object ["type" .= ("string" :: Text)]
+             , "age"      .= object ["type" .= ("integer" :: Text)]
+             , "location" .= object ["type" .= ("geo_point" :: Text)]
+             ]]
 
 exampleTweet :: Tweet
 exampleTweet = Tweet { user     = "bitemyapp"
@@ -312,6 +366,57 @@ searchExpectSource src expected = do
   liftIO $
     value `shouldBe` expected
 
+withSnapshotRepo
+    :: ( MonadMask m
+       , MonadBH m
+       )
+    => SnapshotRepoName
+    -> (GenericSnapshotRepo -> m a)
+    -> m a
+withSnapshotRepo srn@(SnapshotRepoName n) f = do
+  repoPaths <- liftIO getRepoPaths
+  -- we'll use the first repo path if available, otherwise system temp
+  -- dir. Note that this will fail on ES > 1.6, so be sure you use
+  -- @when' canSnapshot@.
+  case repoPaths of
+    (firstRepoPath:_) -> withTempDirectory firstRepoPath (T.unpack n) $ \dir -> bracket (alloc dir) free f
+    [] -> withSystemTempDirectory (T.unpack n) $ \dir -> bracket (alloc dir) free f
+  where
+    alloc dir = do
+      liftIO (setFileMode dir mode)
+      let repo = FsSnapshotRepo srn "bloodhound-tests-backups" True Nothing Nothing Nothing
+      resp <- updateSnapshotRepo defaultSnapshotRepoUpdateSettings repo
+      liftIO (validateStatus resp 200)
+      return (toGSnapshotRepo repo)
+    mode = ownerModes `unionFileModes` groupModes `unionFileModes` otherModes
+    free GenericSnapshotRepo {..} = do
+      resp <- deleteSnapshotRepo gSnapshotRepoName
+      liftIO (validateStatus resp 200)
+
+
+withSnapshot
+    :: ( MonadMask m
+       , MonadBH m
+       )
+    => SnapshotRepoName
+    -> SnapshotName
+    -> m a
+    -> m a
+withSnapshot srn sn = bracket_ alloc free
+  where
+    alloc = do
+      resp <- createSnapshot srn sn createSettings
+      liftIO (validateStatus resp 200)
+    -- We'll make this synchronous for testing purposes
+    createSettings = defaultSnapshotCreateSettings { snapWaitForCompletion = True
+                                                   , snapIndices = Just (IndexList (testIndex :| []))
+                                                   -- We don't actually need to back up any data
+                                                   }
+    free = do
+      deleteSnapshot srn sn
+
+
+
 data BulkTest = BulkTest { name :: Text } deriving (Eq, Generic, Show)
 instance FromJSON BulkTest where
   parseJSON = genericParseJSON defaultOptions
@@ -350,14 +455,18 @@ class ApproxEq a where
   default (=~) :: (Generic a, GApproxEq (Rep a)) => a -> a -> Bool
   a =~ b = gApproxEq (G.from a) (G.from b)
 
+  showApproxEq :: a -> String
+  default showApproxEq :: (Show a) => a -> String
+  showApproxEq = show
+
 instance ApproxEq NominalDiffTime where (=~) = (==)
 instance ApproxEq UTCTime where (=~) = (==)
 instance ApproxEq Text where (=~) = (==)
 instance ApproxEq Bool where (=~) = (==)
 instance ApproxEq Int where (=~) = (==)
 instance ApproxEq Double where (=~) = (==)
-instance ApproxEq a => ApproxEq (NonEmpty a)
-instance ApproxEq a => ApproxEq (Maybe a)
+instance (ApproxEq a, Show a) => ApproxEq (NonEmpty a)
+instance (ApproxEq a, Show a) => ApproxEq (Maybe a)
 instance ApproxEq GeoPoint
 instance ApproxEq Regexp
 instance ApproxEq RangeValue
@@ -374,6 +483,7 @@ instance ApproxEq RegexpFlag
 instance ApproxEq RegexpFlags
 instance ApproxEq NullValue
 instance ApproxEq Version
+instance ApproxEq VersionNumber
 instance ApproxEq DistanceRange
 instance ApproxEq IndexName
 instance ApproxEq MappingName
@@ -470,15 +580,21 @@ instance ApproxEq BoolMatch
 instance ApproxEq MultiMatchQuery
 instance ApproxEq IndexSettings
 instance ApproxEq AllocationPolicy
-instance ApproxEq Char
-instance ApproxEq a => ApproxEq [a] where
+instance ApproxEq Char where
+  (=~) = (==)
+instance ApproxEq Vers.Version where
+  (=~) = (==)
+instance (ApproxEq a, Show a) => ApproxEq [a] where
   as =~ bs = and (zipWith (=~) as bs)
 instance (ApproxEq l, ApproxEq r) => ApproxEq (Either l r) where
   Left a =~ Left b = a =~ b
   Right a =~ Right b = a =~ b
   _ =~ _ = False
+  showApproxEq (Left x)  = "Left " <> showApproxEq x
+  showApproxEq (Right x) = "Right " <> showApproxEq x
 instance ApproxEq NodeAttrFilter
 instance ApproxEq NodeAttrName
+instance ApproxEq BuildHash
 
 -- | Due to the way nodeattrfilters get serialized here, they may come
 -- out in a different order, but they are morally equivalent
@@ -490,6 +606,10 @@ instance ApproxEq UpdatableIndexSetting where
   RoutingAllocationRequire a =~ RoutingAllocationRequire b =
     NE.sort a =~ NE.sort b
   a =~ b = a == b
+  showApproxEq (RoutingAllocationInclude xs) = show (RoutingAllocationInclude (NE.sort xs))
+  showApproxEq (RoutingAllocationExclude xs) = show (RoutingAllocationExclude (NE.sort xs))
+  showApproxEq (RoutingAllocationRequire xs) = show (RoutingAllocationRequire (NE.sort xs))
+  showApproxEq x = show x
 
 
 noDuplicates :: Eq a => [a] -> Bool
@@ -498,8 +618,10 @@ noDuplicates xs = nub xs == xs
 instance Arbitrary NominalDiffTime where
   arbitrary = fromInteger <$> arbitrary
 
+#if !MIN_VERSION_QuickCheck(2,8,0)
 instance (Arbitrary k, Ord k, Arbitrary v) => Arbitrary (M.Map k v) where
   arbitrary = M.fromList <$> arbitrary
+#endif
 
 instance Arbitrary Text where
   arbitrary = T.pack <$> arbitrary
@@ -513,8 +635,10 @@ instance Arbitrary Day where
     arbitrary = ModifiedJulianDay <$> (2000 +) <$> arbitrary
     shrink    = (ModifiedJulianDay <$>) . shrink . toModifiedJulianDay
 
+#if !MIN_VERSION_QuickCheck(2,9,0)
 instance Arbitrary a => Arbitrary (NonEmpty a) where
   arbitrary = liftA2 (:|) arbitrary arbitrary
+#endif
 
 arbitraryScore :: Gen Score
 arbitraryScore = fmap getPositive <$> arbitrary
@@ -546,8 +670,8 @@ getSource = fmap _source . foundResult
 grabFirst :: Either EsError (SearchResult a) -> Either EsError a
 grabFirst r =
   case fmap (hitSource . head . hits . searchHits) r of
-    (Left e) -> Left e
-    (Right Nothing) -> Left (EsError 500 "Source was missing")
+    (Left e)         -> Left e
+    (Right Nothing)  -> Left (EsError 500 "Source was missing")
     (Right (Just x)) -> Right x
 
 -------------------------------------------------------------------------------
@@ -658,7 +782,7 @@ instance Arbitrary ReplicaBounds where
                                     return (ReplicasLowerBounded a)
 
 instance Arbitrary NodeAttrName where
-  arbitrary = NodeAttrName . T.pack . getNonEmpty <$> arbitrary
+  arbitrary = NodeAttrName . T.pack <$> listOf1 arbitraryAlphaNum
 
 
 instance Arbitrary NodeAttrFilter where
@@ -667,113 +791,143 @@ instance Arbitrary NodeAttrFilter where
     s:ss <- listOf1 (listOf1 arbitraryAlphaNum)
     let ts = T.pack <$> s :| ss
     return (NodeAttrFilter n ts)
+  shrink = genericShrink
 
-$(derive makeArbitrary ''IndexName)
-$(derive makeArbitrary ''MappingName)
-$(derive makeArbitrary ''DocId)
-$(derive makeArbitrary ''Version)
-$(derive makeArbitrary ''IndexAliasRouting)
-$(derive makeArbitrary ''ShardCount)
-$(derive makeArbitrary ''ReplicaCount)
-$(derive makeArbitrary ''TemplateName)
-$(derive makeArbitrary ''TemplatePattern)
-$(derive makeArbitrary ''QueryString)
-$(derive makeArbitrary ''CacheName)
-$(derive makeArbitrary ''CacheKey)
-$(derive makeArbitrary ''Existence)
-$(derive makeArbitrary ''CutoffFrequency)
-$(derive makeArbitrary ''Analyzer)
-$(derive makeArbitrary ''MaxExpansions)
-$(derive makeArbitrary ''Lenient)
-$(derive makeArbitrary ''Tiebreaker)
-$(derive makeArbitrary ''Boost)
-$(derive makeArbitrary ''BoostTerms)
-$(derive makeArbitrary ''MinimumMatch)
-$(derive makeArbitrary ''DisableCoord)
-$(derive makeArbitrary ''IgnoreTermFrequency)
-$(derive makeArbitrary ''MinimumTermFrequency)
-$(derive makeArbitrary ''MaxQueryTerms)
-$(derive makeArbitrary ''Fuzziness)
-$(derive makeArbitrary ''PrefixLength)
-$(derive makeArbitrary ''TypeName)
-$(derive makeArbitrary ''PercentMatch)
-$(derive makeArbitrary ''StopWord)
-$(derive makeArbitrary ''QueryPath)
-$(derive makeArbitrary ''AllowLeadingWildcard)
-$(derive makeArbitrary ''LowercaseExpanded)
-$(derive makeArbitrary ''EnablePositionIncrements)
-$(derive makeArbitrary ''AnalyzeWildcard)
-$(derive makeArbitrary ''GeneratePhraseQueries)
-$(derive makeArbitrary ''Locale)
-$(derive makeArbitrary ''MaxWordLength)
-$(derive makeArbitrary ''MinWordLength)
-$(derive makeArbitrary ''PhraseSlop)
-$(derive makeArbitrary ''MinDocFrequency)
-$(derive makeArbitrary ''MaxDocFrequency)
-$(derive makeArbitrary ''Regexp)
-$(derive makeArbitrary ''SimpleQueryStringQuery)
-$(derive makeArbitrary ''FieldOrFields)
-$(derive makeArbitrary ''SimpleQueryFlag)
-$(derive makeArbitrary ''RegexpQuery)
-$(derive makeArbitrary ''QueryStringQuery)
-$(derive makeArbitrary ''RangeQuery)
-$(derive makeArbitrary ''RangeValue)
-$(derive makeArbitrary ''PrefixQuery)
-$(derive makeArbitrary ''NestedQuery)
-$(derive makeArbitrary ''MoreLikeThisFieldQuery)
-$(derive makeArbitrary ''MoreLikeThisQuery)
-$(derive makeArbitrary ''IndicesQuery)
-$(derive makeArbitrary ''HasParentQuery)
-$(derive makeArbitrary ''HasChildQuery)
-$(derive makeArbitrary ''FuzzyQuery)
-$(derive makeArbitrary ''FuzzyLikeFieldQuery)
-$(derive makeArbitrary ''FuzzyLikeThisQuery)
-$(derive makeArbitrary ''FilteredQuery)
-$(derive makeArbitrary ''DisMaxQuery)
-$(derive makeArbitrary ''CommonTermsQuery)
-$(derive makeArbitrary ''DistanceRange)
-$(derive makeArbitrary ''MultiMatchQuery)
-$(derive makeArbitrary ''LessThanD)
-$(derive makeArbitrary ''LessThanEqD)
-$(derive makeArbitrary ''GreaterThanD)
-$(derive makeArbitrary ''GreaterThanEqD)
-$(derive makeArbitrary ''LessThan)
-$(derive makeArbitrary ''LessThanEq)
-$(derive makeArbitrary ''GreaterThan)
-$(derive makeArbitrary ''GreaterThanEq)
-$(derive makeArbitrary ''GeoPoint)
-$(derive makeArbitrary ''NullValue)
-$(derive makeArbitrary ''MinimumMatchHighLow)
-$(derive makeArbitrary ''CommonMinimumMatch)
-$(derive makeArbitrary ''BoostingQuery)
-$(derive makeArbitrary ''BoolQuery)
-$(derive makeArbitrary ''MatchQuery)
-$(derive makeArbitrary ''MultiMatchQueryType)
-$(derive makeArbitrary ''BooleanOperator)
-$(derive makeArbitrary ''ZeroTermsQuery)
-$(derive makeArbitrary ''MatchQueryType)
-$(derive makeArbitrary ''SearchAliasRouting)
-$(derive makeArbitrary ''ScoreType)
-$(derive makeArbitrary ''Distance)
-$(derive makeArbitrary ''DistanceUnit)
-$(derive makeArbitrary ''DistanceType)
-$(derive makeArbitrary ''OptimizeBbox)
-$(derive makeArbitrary ''GeoBoundingBoxConstraint)
-$(derive makeArbitrary ''GeoFilterType)
-$(derive makeArbitrary ''GeoBoundingBox)
-$(derive makeArbitrary ''LatLon)
-$(derive makeArbitrary ''RangeExecution)
-$(derive makeArbitrary ''RegexpFlag)
-$(derive makeArbitrary ''BoolMatch)
-$(derive makeArbitrary ''Term)
-$(derive makeArbitrary ''IndexSettings)
-$(derive makeArbitrary ''UpdatableIndexSetting)
-$(derive makeArbitrary ''Bytes)
-$(derive makeArbitrary ''AllocationPolicy)
-$(derive makeArbitrary ''InitialShardCount)
-$(derive makeArbitrary ''FSType)
-$(derive makeArbitrary ''CompoundFormat)
+instance Arbitrary VersionNumber where
+  arbitrary = mk . fmap getPositive . getNonEmpty <$> arbitrary
+    where
+      mk versions = VersionNumber (Vers.Version versions [])
 
+instance Arbitrary IndexName where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MappingName where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary DocId where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Version where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary BuildHash where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary IndexAliasRouting where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary ShardCount where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary ReplicaCount where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary TemplateName where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary TemplatePattern where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary QueryString where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary CacheName where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary CacheKey where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Existence where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary CutoffFrequency where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Analyzer where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MaxExpansions where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Lenient where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Tiebreaker where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Boost where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary BoostTerms where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MinimumMatch where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary DisableCoord where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary IgnoreTermFrequency where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MinimumTermFrequency where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MaxQueryTerms where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Fuzziness where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary PrefixLength where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary TypeName where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary PercentMatch where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary StopWord where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary QueryPath where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary AllowLeadingWildcard where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary LowercaseExpanded where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary EnablePositionIncrements where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary AnalyzeWildcard where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary GeneratePhraseQueries where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Locale where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MaxWordLength where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MinWordLength where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary PhraseSlop where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MinDocFrequency where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MaxDocFrequency where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Regexp where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary SimpleQueryStringQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary FieldOrFields where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary SimpleQueryFlag where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary RegexpQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary QueryStringQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary RangeQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary RangeValue where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary PrefixQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary NestedQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MoreLikeThisFieldQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MoreLikeThisQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary IndicesQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary HasParentQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary HasChildQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary FuzzyQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary FuzzyLikeFieldQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary FuzzyLikeThisQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary FilteredQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary DisMaxQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary CommonTermsQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary DistanceRange where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MultiMatchQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary LessThanD where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary LessThanEqD where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary GreaterThanD where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary GreaterThanEqD where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary LessThan where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary LessThanEq where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary GreaterThan where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary GreaterThanEq where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary GeoPoint where
+  arbitrary = GeoPoint <$> (arbitrary `suchThat` reasonableFieldName) <*> arbitrary
+    where
+      -- These are problematic for geopoint for obvious reasons
+      reasonableFieldName (FieldName "from") = False
+      reasonableFieldName (FieldName "to") = False
+      reasonableFieldName _ = True
+  shrink = genericShrink
+instance Arbitrary NullValue where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MinimumMatchHighLow where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary CommonMinimumMatch where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary BoostingQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary BoolQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MatchQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MultiMatchQueryType where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary BooleanOperator where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary ZeroTermsQuery where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary MatchQueryType where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary SearchAliasRouting where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary ScoreType where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Distance where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary DistanceUnit where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary DistanceType where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary OptimizeBbox where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary GeoBoundingBoxConstraint where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary GeoFilterType where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary GeoBoundingBox where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary LatLon where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary RangeExecution where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary RegexpFlag where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary BoolMatch where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Term where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary IndexSettings where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary UpdatableIndexSetting where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Bytes where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary AllocationPolicy where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary InitialShardCount where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary FSType where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary CompoundFormat where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary FsSnapshotRepo where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary SnapshotRepoName where arbitrary = sopArbitrary; shrink = genericShrink
+
+newtype UpdatableIndexSetting' = UpdatableIndexSetting' UpdatableIndexSetting
+                               deriving (Show, Eq, ToJSON, FromJSON, ApproxEq, Typeable)
+
+instance Arbitrary UpdatableIndexSetting' where
+  arbitrary = do
+    settings <- arbitrary
+    return $ UpdatableIndexSetting' $ case settings of
+      RoutingAllocationInclude xs -> RoutingAllocationInclude (dropDuplicateAttrNames xs)
+      RoutingAllocationExclude xs -> RoutingAllocationExclude (dropDuplicateAttrNames xs)
+      RoutingAllocationRequire xs -> RoutingAllocationRequire (dropDuplicateAttrNames xs)
+      x -> x
+    where
+      dropDuplicateAttrNames = NE.fromList . L.nubBy sameAttrName . NE.toList
+      sameAttrName a b = nodeAttrFilterName a == nodeAttrFilterName b
 
 main :: IO ()
 main = hspec $ do
@@ -788,11 +942,16 @@ main = hspec $ do
         validateStatus resp 200
         validateStatus deleteResp 200
 
-  describe "error parsing" $ do
-    it "can parse EsErrors" $ withTestEnv $ do
+  describe "error parsing"  $ do
+    it "can parse EsErrors for < 2.0" $ when' (atmost es16) $ withTestEnv $ do
       res <- getDocument (IndexName "bogus") (MappingName "also_bogus") (DocId "bogus_as_well")
       let errorResp = eitherDecode (responseBody res)
       liftIO (errorResp `shouldBe` Right (EsError 404 "IndexMissingException[[bogus] missing]"))
+
+    it "can parse EsErrors for >= 2.0" $ when' (atleast es20) $ withTestEnv $ do
+      res <- getDocument (IndexName "bogus") (MappingName "also_bogus") (DocId "bogus_as_well")
+      let errorResp = eitherDecode (responseBody res)
+      liftIO (errorResp `shouldBe` Right (EsError 404 "no such index"))
 
   describe "document API" $ do
     it "indexes, updates, gets, and then deletes the generated document" $ withTestEnv $ do
@@ -827,8 +986,8 @@ main = hspec $ do
 
     it "indexes two documents in a parent/child relationship and checks that the child exists" $ withTestEnv $ do
       resetIndex
-      _ <- putMapping testIndex (MappingName "parent") ParentMapping
       _ <- putMapping testIndex (MappingName "child") ChildMapping
+      _ <- putMapping testIndex (MappingName "parent") ParentMapping
       _ <- indexDocument testIndex (MappingName "parent") defaultIndexDocumentSettings exampleTweet (DocId "1")
       let parent = (Just . DocumentParent . DocId) "1"
           ids = IndexDocumentSettings NoVersionControl parent
@@ -1147,6 +1306,29 @@ main = hspec $ do
       searchExpectAggs search
       searchValidBucketAgg search "users" toTerms
 
+    it "return sub-aggregation results" $ withTestEnv $ do
+      _ <- insertData
+      let subaggs = mkAggregations "age_agg" . TermsAgg $ mkTermsAggregation "age"
+          agg = TermsAgg $ (mkTermsAggregation "user") { termAggs = Just subaggs}
+          search = mkAggregateSearch Nothing $ mkAggregations "users" agg
+      reply <- searchByIndex testIndex search
+      let result = decode (responseBody reply) :: Maybe (SearchResult Tweet)
+          usersAggResults = result >>= aggregations >>= toTerms "users"
+          subAggResults = usersAggResults >>= (listToMaybe . buckets) >>= termsAggs >>= toTerms "age_agg"
+          subAddResultsExists = isJust subAggResults
+      liftIO $ (subAddResultsExists) `shouldBe` True
+
+    it "returns cardinality aggregation results" $ withTestEnv $ do
+      _ <- insertData
+      let cardinality = CardinalityAgg $ mkCardinalityAggregation $ FieldName "user"
+      let search = mkAggregateSearch Nothing $ mkAggregations "users" cardinality
+      let search' = search { Database.V1.Bloodhound.from = From 0, size = Size 0 }
+      searchExpectAggs search'
+      let docCountPair k n = (k, object ["value" .= Number n])
+      res <- searchTweets search'
+      liftIO $
+        fmap aggregations res `shouldBe` Right (Just (M.fromList [ docCountPair "users" 1]))
+
     it "can give collection hint parameters to term aggregations" $ when' (atleast es13) $ withTestEnv $ do
       _ <- insertData
       let terms = TermsAgg $ (mkTermsAggregation "user") { termCollectMode = Just BreadthFirst }
@@ -1365,6 +1547,132 @@ main = hspec $ do
                    (dv <= maxBound) .&&.
                    docVersionNumber dv === i
 
+  describe "FsSnapshotRepo" $ do
+    prop "SnapshotRepo laws" $ \fsr ->
+      fromGSnapshotRepo (toGSnapshotRepo fsr) === Right (fsr :: FsSnapshotRepo)
+
+  describe "snapshot repos" $ do
+    it "always parses all snapshot repos API" $ when' canSnapshot $ withTestEnv $ do
+      res <- getSnapshotRepos AllSnapshotRepos
+      liftIO $ case res of
+        Left e -> expectationFailure ("Expected a right but got Left " <> show e)
+        Right _ -> return ()
+
+    it "finds an existing list of repos" $ when' canSnapshot $ withTestEnv $ do
+      let r1n = SnapshotRepoName "bloodhound-repo1"
+      let r2n = SnapshotRepoName "bloodhound-repo2"
+      withSnapshotRepo r1n $ \r1 ->
+        withSnapshotRepo r2n $ \r2 -> do
+          repos <- getSnapshotRepos (SnapshotRepoList (ExactRepo r1n :| [ExactRepo r2n]))
+          liftIO $ case repos of
+            Right xs -> do
+              let srt = L.sortBy (comparing gSnapshotRepoName)
+              srt xs `shouldBe` srt [r1, r2]
+            Left e -> expectationFailure (show e)
+
+    it "creates and updates with updateSnapshotRepo" $ when' canSnapshot $ withTestEnv $ do
+      let r1n = SnapshotRepoName "bloodhound-repo1"
+      withSnapshotRepo r1n $ \r1 -> do
+        let Just (String dir) = HM.lookup "location" (gSnapshotRepoSettingsObject (gSnapshotRepoSettings r1))
+        let noCompression = FsSnapshotRepo r1n (T.unpack dir) False Nothing Nothing Nothing
+        resp <- updateSnapshotRepo defaultSnapshotRepoUpdateSettings noCompression
+        liftIO (validateStatus resp 200)
+        Right [roundtrippedNoCompression] <- getSnapshotRepos (SnapshotRepoList (ExactRepo r1n :| []))
+        liftIO (roundtrippedNoCompression `shouldBe` toGSnapshotRepo noCompression)
+
+    -- verify came around in 1.4 it seems
+    it "can verify existing repos" $ when' canSnapshot $ when' (atleast es14) $ withTestEnv $ do
+      let r1n = SnapshotRepoName "bloodhound-repo1"
+      withSnapshotRepo r1n $ \_ -> do
+        res <- verifySnapshotRepo r1n
+        liftIO $ case res of
+          Right (SnapshotVerification vs)
+            | null vs -> expectationFailure "Expected nonempty set of verifying nodes"
+            | otherwise -> return ()
+          Left e -> expectationFailure (show e)
+
+  describe "snapshots" $ do
+    it "always parses all snapshots API" $ when' canSnapshot $ withTestEnv $ do
+      let r1n = SnapshotRepoName "bloodhound-repo1"
+      withSnapshotRepo r1n $ \_ -> do
+        res <- getSnapshots r1n AllSnapshots
+        liftIO $ case res of
+          Left e -> expectationFailure ("Expected a right but got Left " <> show e)
+          Right _ -> return ()
+
+    it "can parse a snapshot that it created" $ when' canSnapshot $ withTestEnv $ do
+      let r1n = SnapshotRepoName "bloodhound-repo1"
+      withSnapshotRepo r1n $ \_ -> do
+        let s1n = SnapshotName "example-snapshot"
+        withSnapshot r1n s1n $ do
+          res <- getSnapshots r1n (SnapshotList (ExactSnap s1n :| []))
+          liftIO $ case res of
+            Right [snap]
+              | snapInfoState snap == SnapshotSuccess &&
+                snapInfoName snap == s1n -> return ()
+              | otherwise -> expectationFailure (show snap)
+            Right [] -> expectationFailure "There were no snapshots"
+            Right snaps -> expectationFailure ("Expected 1 snapshot but got" <> show (length snaps))
+            Left e -> expectationFailure (show e)
+
+  describe "snapshot restore" $ do
+    it "can restore a snapshot that we create" $ when' canSnapshot $ withTestEnv $ do
+      let r1n = SnapshotRepoName "bloodhound-repo1"
+      withSnapshotRepo r1n $ \_ -> do
+        let s1n = SnapshotName "example-snapshot"
+        withSnapshot r1n s1n $ do
+          let settings = defaultSnapshotRestoreSettings { snapRestoreWaitForCompletion = True }
+          -- have to close an index to restore it
+          resp1 <- closeIndex testIndex
+          liftIO (validateStatus resp1 200)
+          resp2 <- restoreSnapshot r1n s1n settings
+          liftIO (validateStatus resp2 200)
+
+    it "can restore and rename" $ when' canSnapshot $ withTestEnv $ do
+      let r1n = SnapshotRepoName "bloodhound-repo1"
+      withSnapshotRepo r1n $ \_ -> do
+        let s1n = SnapshotName "example-snapshot"
+        withSnapshot r1n s1n $ do
+          let pat = RestoreRenamePattern "bloodhound-tests-twitter-(\\d+)"
+          let replace = RRTLit "restored-" :| [RRSubWholeMatch]
+          let expectedIndex = IndexName "restored-bloodhound-tests-twitter-1"
+          oldEnoughForOverrides <- liftIO (atleast es15)
+          let overrides = RestoreIndexSettings { restoreOverrideReplicas = Just (ReplicaCount 0) }
+          let settings = defaultSnapshotRestoreSettings { snapRestoreWaitForCompletion = True
+                                                        , snapRestoreRenamePattern = Just pat
+                                                        , snapRestoreRenameReplacement = Just replace
+                                                        , snapRestoreIndexSettingsOverrides = if oldEnoughForOverrides
+                                                                                              then Just overrides
+                                                                                              else Nothing
+                                                        }
+          -- have to close an index to restore it
+          let go = do
+                resp <- restoreSnapshot r1n s1n settings
+                liftIO (validateStatus resp 200)
+                exists <- indexExists expectedIndex
+                liftIO (exists `shouldBe` True)
+          go `finally` deleteIndex expectedIndex
+
+  describe "getNodesInfo" $ do
+     it "fetches the responding node when LocalNode is used" $ withTestEnv $ do
+       res <- getNodesInfo LocalNode
+       liftIO $ case res of
+         -- This is really just a smoke test for response
+         -- parsing. Node info is so variable, there's not much I can
+         -- assert here.
+         Right NodesInfo {..} -> length nodesInfo `shouldBe` 1
+         Left e -> expectationFailure ("Expected NodesInfo but got " <> show e)
+
+  describe "getNodesStats" $ do
+     it "fetches the responding node when LocalNode is used" $ withTestEnv $ do
+       res <- getNodesStats LocalNode
+       liftIO $ case res of
+         -- This is really just a smoke test for response
+         -- parsing. Node stats is so variable, there's not much I can
+         -- assert here.
+         Right NodesStats {..} -> length nodesStats `shouldBe` 1
+         Left e -> expectationFailure ("Expected NodesStats but got " <> show e)
+
   describe "Enum DocVersion" $ do
     it "follows the laws of Enum, Bounded" $ do
       evaluate (succ maxBound :: DocVersion) `shouldThrow` anyErrorCall
@@ -1549,10 +1857,24 @@ main = hspec $ do
     propJSON (Proxy :: Proxy Term)
     propJSON (Proxy :: Proxy MultiMatchQuery)
     propJSON (Proxy :: Proxy IndexSettings)
-    propJSON (Proxy :: Proxy UpdatableIndexSetting)
+    propJSON (Proxy :: Proxy UpdatableIndexSetting')
     propJSON (Proxy :: Proxy ReplicaBounds)
     propJSON (Proxy :: Proxy Bytes)
     propJSON (Proxy :: Proxy AllocationPolicy)
     propJSON (Proxy :: Proxy InitialShardCount)
     propJSON (Proxy :: Proxy FSType)
     propJSON (Proxy :: Proxy CompoundFormat)
+
+-- Temporary solution for lacking of generic derivation of Arbitrary
+-- We use generics-sop, as it's much more concise than directly using GHC.Generics
+--
+-- This will be unneeded after https://github.com/nick8325/quickcheck/pull/112
+-- is merged and released
+sopArbitrary :: forall a. (Generic a, SOP.GTo a, SOP.All SOP.SListI (SOP.GCode a), SOP.All2 Arbitrary (SOP.GCode a)) => Gen a
+sopArbitrary = fmap SOP.gto sopArbitrary'
+
+sopArbitrary' :: forall xss. (SOP.All SOP.SListI xss, SOP.All2 Arbitrary xss) => Gen (SOP.SOP SOP.I xss)
+sopArbitrary' = SOP.hsequence =<< elements (SOP.apInjs_POP $ SOP.hcpure p arbitrary)
+  where
+    p :: Proxy Arbitrary
+    p = Proxy

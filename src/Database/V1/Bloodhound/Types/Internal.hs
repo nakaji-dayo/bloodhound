@@ -15,15 +15,16 @@
 -- Internal data types for Bloodhound. These types may change without
 -- notice so import at your own risk.
 -------------------------------------------------------------------------------
-module Database.Bloodhound.Types.Internal
+module Database.V1.Bloodhound.Types.Internal
     ( BHEnv(..)
     , Server(..)
     , MonadBH(..)
     ) where
 
 
-import           Control.Applicative
+import           Control.Applicative  as A
 import           Control.Monad.Reader
+import           Data.Aeson
 import           Data.Text            (Text)
 import           Data.Typeable        (Typeable)
 import           GHC.Generics         (Generic)
@@ -43,7 +44,7 @@ instance (Functor m, Applicative m, MonadIO m) => MonadBH (ReaderT BHEnv m) wher
 
 {-| 'Server' is used with the client functions to point at the ES instance
 -}
-newtype Server = Server Text deriving (Eq, Show, Generic, Typeable)
+newtype Server = Server Text deriving (Eq, Show, Generic, Typeable, FromJSON)
 
 {-| All API calls to Elasticsearch operate within
     MonadBH
@@ -51,6 +52,6 @@ newtype Server = Server Text deriving (Eq, Show, Generic, Typeable)
     own monad transformer stack. A default instance for a ReaderT and
     alias 'BH' is provided for the simple case.
 -}
-class (Functor m, Applicative m, MonadIO m) => MonadBH m where
+class (Functor m, A.Applicative m, MonadIO m) => MonadBH m where
   getBHEnv :: m BHEnv
 
