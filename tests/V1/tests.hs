@@ -1245,7 +1245,7 @@ main = hspec $ do
       _ <- insertData
       let filter = RangeFilter (FieldName "age")
                    (RangeDoubleGtLt (GreaterThan 1000.0) (LessThan 100000.0))
-                   RangeExecutionIndex False
+                   (Just RangeExecutionIndex) False
       let search = mkSearch Nothing (Just filter)
       myTweet <- searchTweet search
       liftIO $
@@ -1261,7 +1261,7 @@ main = hspec $ do
                     (LessThanD (UTCTime
                                 (ModifiedJulianDay 55000)
                                 (secondsToDiffTime 11))))
-                   RangeExecutionIndex False
+                   (Just RangeExecutionIndex) False
       let search = mkSearch Nothing (Just filter)
       myTweet <- searchTweet search
       liftIO $
