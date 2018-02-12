@@ -1,0 +1,11 @@
+flags:
+  bloodhound-examples:
+    werror: true
+
+packages:
+- '.'
+- './examples'
+extra-deps:
+  - quickcheck-properties-0.1
+
+resolver: lts-8.14

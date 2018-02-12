@@ -151,8 +151,11 @@ dispatch dMethod url body = do
   initReq <- liftIO $ parseUrl' url
   reqHook <- bhRequestHook A.<$> getBHEnv
   let reqBody = RequestBodyLBS $ fromMaybe emptyBody body
-  req <- liftIO $ reqHook $ setRequestIgnoreStatus $ initReq { method = dMethod
-                                                             , requestBody = reqBody }
+  req <- liftIO
+         $ reqHook
+         $ setRequestIgnoreStatus
+         $ initReq { method = dMethod
+                   , requestBody = reqBody }
   mgr <- bhManager <$> getBHEnv
   liftIO $ httpLbs req mgr
 
@@ -580,14 +583,17 @@ listIndices :: (MonadThrow m, MonadBH m) => m [IndexName]
 listIndices =
   parse . responseBody =<< get =<< url
   where
-    url = joinPath ["_cat/indices?v"]
-    -- parses the tabular format the indices api provides
-    parse body = case T.lines (T.decodeUtf8 (L.toStrict body)) of
-      (hdr:rows) -> let ks = T.words hdr
-                        keyedRows = [ HM.fromList (zip ks (T.words row)) | row <- rows ]
-                        names = catMaybes (HM.lookup "index" <$> keyedRows)
-                    in return (IndexName <$> names)
-      [] -> throwM (EsProtocolException body)
+    url = joinPath ["_cat/indices?format=json"]
+    parse body = maybe (throwM (EsProtocolException body)) return $ do
+      vals <- decode body
+      forM vals $ \val -> do
+        case val of
+          Object obj -> do
+            indexVal <- HM.lookup "index" obj
+            case indexVal of
+              String txt -> Just (IndexName txt)
+              _ -> Nothing
+          _ -> Nothing
 
 -- | 'updateIndexAliases' updates the server's index alias
 -- table. Operations are atomic. Explained in further detail at
@@ -861,17 +867,17 @@ scanSearch indexName mappingName search = do
 --   syntax if you want to add things like aggregations or highlights while still using
 --   this helper function.
 mkSearch :: Maybe Query -> Maybe Filter -> Search
-mkSearch query filter = Search query filter Nothing Nothing Nothing False (From 0) (Size 10) SearchTypeQueryThenFetch Nothing Nothing
+mkSearch query filter = Search query filter Nothing Nothing Nothing False (From 0) (Size 10) SearchTypeQueryThenFetch Nothing Nothing Nothing
 
 -- | 'mkAggregateSearch' is a helper function that defaults everything in a 'Search' except for
 --   the 'Query' and the 'Aggregation'.
 mkAggregateSearch :: Maybe Query -> Aggregations -> Search
-mkAggregateSearch query mkSearchAggs = Search query Nothing Nothing (Just mkSearchAggs) Nothing False (From 0) (Size 0) SearchTypeQueryThenFetch Nothing Nothing
+mkAggregateSearch query mkSearchAggs = Search query Nothing Nothing (Just mkSearchAggs) Nothing False (From 0) (Size 0) SearchTypeQueryThenFetch Nothing Nothing Nothing
 
 -- | 'mkHighlightSearch' is a helper function that defaults everything in a 'Search' except for
 --   the 'Query' and the 'Aggregation'.
 mkHighlightSearch :: Maybe Query -> Highlights -> Search
-mkHighlightSearch query searchHighlights = Search query Nothing Nothing Nothing (Just searchHighlights) False (From 0) (Size 10) SearchTypeQueryThenFetch Nothing Nothing
+mkHighlightSearch query searchHighlights = Search query Nothing Nothing Nothing (Just searchHighlights) False (From 0) (Size 10) SearchTypeQueryThenFetch Nothing Nothing Nothing
 
 -- | 'pageSearch' is a helper function that takes a search and assigns the from
 --    and size fields for the search. The from parameter defines the offset

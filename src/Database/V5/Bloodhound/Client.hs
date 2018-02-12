@@ -7,7 +7,7 @@
 -- Module : Database.Bloodhound.Client
 -- Copyright : (C) 2014 Chris Allen
 -- License : BSD-style (see the file LICENSE)
--- Maintainer : Chris Allen <cma@bitemyapp.com
+-- Maintainer : Chris Allen <cma@bitemyapp.com>
 -- Stability : provisional
 -- Portability : OverloadedStrings
 --
@@ -25,6 +25,7 @@ module Database.V5.Bloodhound.Client
          withBH
        -- ** Indices
        , createIndex
+       , createIndexWith
        , deleteIndex
        , updateIndexSettings
        , getIndexSettings
@@ -37,6 +38,7 @@ module Database.V5.Bloodhound.Client
        -- *** Index Aliases
        , updateIndexAliases
        , getIndexAliases
+       , deleteIndexAlias
        -- *** Index Templates
        , putTemplate
        , templateExists
@@ -52,6 +54,7 @@ module Database.V5.Bloodhound.Client
        -- ** Searching
        , searchAll
        , searchByIndex
+       , searchByIndices
        , searchByType
        , scanSearch
        , getInitialScroll
@@ -127,6 +130,7 @@ import           Database.V5.Bloodhound.Types
 -- >>> :set -XOverloadedStrings
 -- >>> :set -XDeriveGeneric
 -- >>> import Database.V5.Bloodhound
+-- >>> import Network.HTTP.Client
 -- >>> let testServer = (Server "http://localhost:9200")
 -- >>> let runBH' = withBH defaultManagerSettings testServer
 -- >>> let testIndex = IndexName "twitter"
@@ -207,8 +211,15 @@ dispatch dMethod url body = do
   initReq <- liftIO $ parseUrl' url
   reqHook <- bhRequestHook A.<$> getBHEnv
   let reqBody = RequestBodyLBS $ fromMaybe emptyBody body
-  req <- liftIO $ reqHook $ setRequestIgnoreStatus $ initReq { method = dMethod
-                                                             , requestBody = reqBody }
+  req <- liftIO
+         $ reqHook
+         $ setRequestIgnoreStatus
+         $ initReq { method = dMethod
+                   , requestHeaders =
+                     ("Content-Type", "application/json") : requestHeaders initReq
+                   , requestBody = reqBody }
+  -- req <- liftIO $ reqHook $ setRequestIgnoreStatus $ initReq { method = dMethod
+  --                                                            , requestBody = reqBody }
   mgr <- bhManager <$> getBHEnv
   liftIO $ httpLbs req mgr
 
@@ -503,6 +514,24 @@ createIndex indexSettings (IndexName indexName) =
   where url = joinPath [indexName]
         body = Just $ encode indexSettings
 
+-- | Create an index, providing it with any number of settings. This
+--   is more expressive than 'createIndex' but makes is more verbose
+--   for the common case of configuring only the shard count and
+--   replica count.
+createIndexWith :: MonadBH m
+  => [UpdatableIndexSetting]
+  -> Int -- ^ shard count
+  -> IndexName 
+  -> m Reply
+createIndexWith updates shards (IndexName indexName) =
+  bindM2 put url (return (Just body))
+  where url = joinPath [indexName]
+        body = encode $ object
+          ["settings" .= deepMerge 
+            ( HM.singleton "index.number_of_shards" (toJSON shards) :
+              [u | Object u <- toJSON <$> updates]
+            )
+          ]
 
 -- | 'deleteIndex' will delete an index given a 'Server', and an 'IndexName'.
 --
@@ -535,7 +564,6 @@ getIndexSettings :: (MonadBH m, MonadThrow m) => IndexName
 getIndexSettings (IndexName indexName) = do
   parseEsResponse =<< get =<< url
   where url = joinPath [indexName, "_settings"]
-
 
 -- | 'forceMergeIndex' 
 -- 
@@ -672,14 +700,17 @@ listIndices :: (MonadThrow m, MonadBH m) => m [IndexName]
 listIndices =
   parse . responseBody =<< get =<< url
   where
-    url = joinPath ["_cat/indices?v"]
-    -- parses the tabular format the indices api provides
-    parse body = case T.lines (T.decodeUtf8 (L.toStrict body)) of
-      (hdr:rows) -> let ks = T.words hdr
-                        keyedRows = [ HM.fromList (zip ks (T.words row)) | row <- rows ]
-                        names = catMaybes (HM.lookup "index" <$> keyedRows)
-                    in return (IndexName <$> names)
-      [] -> throwM (EsProtocolException body)
+    url = joinPath ["_cat/indices?format=json"]
+    parse body = maybe (throwM (EsProtocolException body)) return $ do
+      vals <- decode body
+      forM vals $ \val -> do
+        case val of
+          Object obj -> do
+            indexVal <- HM.lookup "index" obj
+            case indexVal of
+              String txt -> Just (IndexName txt)
+              _ -> Nothing
+          _ -> Nothing
 
 -- | 'updateIndexAliases' updates the server's index alias
 -- table. Operations are atomic. Explained in further detail at
@@ -709,6 +740,12 @@ getIndexAliases :: (MonadBH m, MonadThrow m)
                 => m (Either EsError IndexAliasesSummary)
 getIndexAliases = parseEsResponse =<< get =<< url
   where url = joinPath ["_aliases"]
+
+-- | Delete a single alias, removing it from all indices it
+--   is currently associated with.
+deleteIndexAlias :: MonadBH m => IndexAliasName -> m Reply
+deleteIndexAlias (IndexAliasName (IndexName name)) = delete =<< url
+  where url = joinPath ["_all","_alias",name]
 
 -- | 'putTemplate' creates a template given an 'IndexTemplate' and a 'TemplateName'.
 --   Explained in further detail at
@@ -772,7 +809,10 @@ versionCtlParams cfg =
 -- | 'indexDocument' is the primary way to save a single document in
 --   Elasticsearch. The document itself is simply something we can
 --   convert into a JSON 'Value'. The 'DocId' will function as the
---   primary key for the document.
+--   primary key for the document. You are encouraged to generate
+--   your own id's and not rely on ElasticSearch's automatic id
+--   generation. Read more about it here:
+--   https://github.com/bitemyapp/bloodhound/issues/107
 --
 -- >>> resp <- runBH' $ indexDocument testIndex testMapping defaultIndexDocumentSettings exampleTweet (DocId "1")
 -- >>> print resp
@@ -878,6 +918,12 @@ encodeBulkOperation (BulkUpdate (IndexName indexName)
           doc = object ["doc" .= value]
           blob = encode metadata `mappend` "\n" `mappend` encode doc
 
+encodeBulkOperation (BulkCreateEncoding (IndexName indexName)
+                (MappingName mappingName)
+                (DocId docId) encoding) = toLazyByteString blob
+    where metadata = toEncoding (mkBulkStreamValue "create" indexName mappingName docId)
+          blob = fromEncoding metadata <> "\n" <> fromEncoding encoding
+
 -- | 'getDocument' is a straight-forward way to fetch a single document from
 --   Elasticsearch using a 'Server', 'IndexName', 'MappingName', and a 'DocId'.
 --   The 'DocId' is the primary key for your Elasticsearch document.
@@ -926,6 +972,15 @@ searchAll = bindM2 dispatchSearch url . return
 searchByIndex :: MonadBH m => IndexName -> Search -> m Reply
 searchByIndex (IndexName indexName) = bindM2 dispatchSearch url . return
   where url = joinPath [indexName, "_search"]
+
+-- | 'searchByIndices' is a variant of 'searchByIndex' that executes a
+--   'Search' over many indices. This is much faster than using
+--   'mapM' to 'searchByIndex' over a collection since it only
+--   causes a single HTTP request to be emitted.
+searchByIndices :: MonadBH m => NonEmpty IndexName -> Search -> m Reply
+searchByIndices ixs = bindM2 dispatchSearch url . return
+  where url = joinPath [renderedIxs, "_search"]
+        renderedIxs = T.intercalate (T.singleton ',') (map (\(IndexName t) -> t) (toList ixs))
 
 -- | 'searchByType', given a 'Search', 'IndexName', and 'MappingName', will perform that
 --   search against a specific mapping within an index on an Elasticsearch server.
@@ -1044,7 +1099,7 @@ scanSearch indexName mappingName search = do
 -- >>> mkSearch (Just query) Nothing
 -- Search {queryBody = Just (TermQuery (Term {termField = "user", termValue = "bitemyapp"}) Nothing), filterBody = Nothing, sortBody = Nothing, aggBody = Nothing, highlight = Nothing, trackSortScores = False, from = From 0, size = Size 10, searchType = SearchTypeQueryThenFetch, fields = Nothing, source = Nothing}
 mkSearch :: Maybe Query -> Maybe Filter -> Search
-mkSearch query filter = Search query filter Nothing Nothing Nothing False (From 0) (Size 10) SearchTypeQueryThenFetch Nothing Nothing
+mkSearch query filter = Search query filter Nothing Nothing Nothing False (From 0) (Size 10) SearchTypeQueryThenFetch Nothing Nothing Nothing
 
 -- | 'mkAggregateSearch' is a helper function that defaults everything in a 'Search' except for
 --   the 'Query' and the 'Aggregation'.
@@ -1054,7 +1109,7 @@ mkSearch query filter = Search query filter Nothing Nothing Nothing False (From 
 -- TermsAgg (TermsAggregation {term = Left "user", termInclude = Nothing, termExclude = Nothing, termOrder = Nothing, termMinDocCount = Nothing, termSize = Nothing, termShardSize = Nothing, termCollectMode = Just BreadthFirst, termExecutionHint = Nothing, termAggs = Nothing})
 -- >>> let myAggregation = mkAggregateSearch Nothing $ mkAggregations "users" terms
 mkAggregateSearch :: Maybe Query -> Aggregations -> Search
-mkAggregateSearch query mkSearchAggs = Search query Nothing Nothing (Just mkSearchAggs) Nothing False (From 0) (Size 0) SearchTypeQueryThenFetch Nothing Nothing
+mkAggregateSearch query mkSearchAggs = Search query Nothing Nothing (Just mkSearchAggs) Nothing False (From 0) (Size 0) SearchTypeQueryThenFetch Nothing Nothing Nothing
 
 -- | 'mkHighlightSearch' is a helper function that defaults everything in a 'Search' except for
 --   the 'Query' and the 'Aggregation'.
@@ -1063,7 +1118,7 @@ mkAggregateSearch query mkSearchAggs = Search query Nothing Nothing (Just mkSear
 -- >>> let testHighlight = Highlights Nothing [FieldHighlight (FieldName "message") Nothing]
 -- >>> let search = mkHighlightSearch (Just query) testHighlight
 mkHighlightSearch :: Maybe Query -> Highlights -> Search
-mkHighlightSearch query searchHighlights = Search query Nothing Nothing Nothing (Just searchHighlights) False (From 0) (Size 10) SearchTypeQueryThenFetch Nothing Nothing
+mkHighlightSearch query searchHighlights = Search query Nothing Nothing Nothing (Just searchHighlights) False (From 0) (Size 10) SearchTypeQueryThenFetch Nothing Nothing Nothing
 
 -- | 'pageSearch' is a helper function that takes a search and assigns the from
 --    and size fields for the search. The from parameter defines the offset

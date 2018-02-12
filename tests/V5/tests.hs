@@ -12,6 +12,9 @@
 #if __GLASGOW_HASKELL__ < 800
 {-# OPTIONS_GHC -fcontext-stack=100 #-}
 #endif
+#if __GLASGOW_HASKELL__ >= 802
+{-# LANGUAGE MonoLocalBinds #-}
+#endif
 module Main where
 
 import           Control.Applicative
@@ -607,6 +610,17 @@ instance (ApproxEq l, Show l, ApproxEq r, Show r) => ApproxEq (Either l r) where
 instance ApproxEq NodeAttrFilter
 instance ApproxEq NodeAttrName
 instance ApproxEq BuildHash
+instance ApproxEq TemplateQueryKeyValuePairs where
+  (=~) = (==)
+instance ApproxEq TemplateQueryInline
+instance ApproxEq Size
+instance ApproxEq PhraseSuggesterHighlighter
+instance ApproxEq PhraseSuggesterCollate
+instance ApproxEq PhraseSuggester
+instance ApproxEq SuggestType
+instance ApproxEq Suggest
+instance ApproxEq DirectGenerators
+instance ApproxEq DirectGeneratorSuggestModeTypes
 
 -- | Due to the way nodeattrfilters get serialized here, they may come
 -- out in a different order, but they are morally equivalent
@@ -717,12 +731,24 @@ instance Arbitrary FieldName where
   shrink = genericShrink
 
 
+#if MIN_VERSION_base(4,10,0)
+-- Test.QuickCheck.Modifiers
+
+qcNonEmptyToNonEmpty :: NonEmptyList a -> NonEmpty a
+qcNonEmptyToNonEmpty (NonEmpty (a : xs)) = (a :| xs)
+qcNonEmptyToNonEmpty (NonEmpty []) = error "NonEmpty was empty!"
+
+instance Arbitrary a => Arbitrary (NonEmpty a) where
+  arbitrary = qcNonEmptyToNonEmpty <$> arbitrary
+#endif
+
 instance Arbitrary RegexpFlags where
   arbitrary = oneof [ pure AllRegexpFlags
                     , pure NoRegexpFlags
                     , SomeRegexpFlags <$> genUniqueFlags
                     ]
     where genUniqueFlags = NE.fromList . nub <$> listOf1 arbitrary
+
   shrink = genericShrink
 
 
@@ -756,6 +782,7 @@ instance Arbitrary Query where
                                  , QuerySimpleQueryStringQuery <$> arbitrary
                                  , QueryRangeQuery <$> arbitrary
                                  , QueryRegexpQuery <$> arbitrary
+                                 , QueryTemplateQueryInline <$> arbitrary
                                  ]
   shrink = genericShrink
 
@@ -790,6 +817,10 @@ instance Arbitrary VersionNumber where
   arbitrary = mk . fmap getPositive . getNonEmpty <$> arbitrary
     where
       mk versions = VersionNumber (Vers.Version versions [])
+
+instance Arbitrary TemplateQueryKeyValuePairs where
+  arbitrary = TemplateQueryKeyValuePairs . HM.fromList <$> arbitrary
+  shrink (TemplateQueryKeyValuePairs x) = map (TemplateQueryKeyValuePairs . HM.fromList) . shrink $ HM.toList x
 
 instance Arbitrary IndexName where arbitrary = sopArbitrary; shrink = genericShrink
 instance Arbitrary MappingName where arbitrary = sopArbitrary; shrink = genericShrink
@@ -890,7 +921,18 @@ instance Arbitrary RegexpFlag where arbitrary = sopArbitrary; shrink = genericSh
 instance Arbitrary BoolMatch where arbitrary = sopArbitrary; shrink = genericShrink
 instance Arbitrary Term where arbitrary = sopArbitrary; shrink = genericShrink
 instance Arbitrary IndexSettings where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary TokenChar where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Ngram where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary TokenizerDefinition where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary AnalyzerDefinition where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary TokenFilterDefinition where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Shingle where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Language where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Analysis where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Tokenizer where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary TokenFilter where arbitrary = sopArbitrary; shrink = genericShrink
 instance Arbitrary UpdatableIndexSetting where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Compression where arbitrary = sopArbitrary; shrink = genericShrink
 instance Arbitrary Bytes where arbitrary = sopArbitrary; shrink = genericShrink
 instance Arbitrary AllocationPolicy where arbitrary = sopArbitrary; shrink = genericShrink
 instance Arbitrary InitialShardCount where arbitrary = sopArbitrary; shrink = genericShrink
@@ -898,6 +940,15 @@ instance Arbitrary FSType where arbitrary = sopArbitrary; shrink = genericShrink
 instance Arbitrary CompoundFormat where arbitrary = sopArbitrary; shrink = genericShrink
 instance Arbitrary FsSnapshotRepo where arbitrary = sopArbitrary; shrink = genericShrink
 instance Arbitrary SnapshotRepoName where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary TemplateQueryInline where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary PhraseSuggesterCollate where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary PhraseSuggesterHighlighter where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Size where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary PhraseSuggester where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary SuggestType where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary Suggest where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary DirectGenerators where arbitrary = sopArbitrary; shrink = genericShrink
+instance Arbitrary DirectGeneratorSuggestModeTypes where arbitrary = sopArbitrary; shrink = genericShrink
 
 newtype UpdatableIndexSetting' = UpdatableIndexSetting' UpdatableIndexSetting
                                deriving (Show, Eq, ToJSON, FromJSON, ApproxEq, Typeable)
@@ -913,6 +964,7 @@ instance Arbitrary UpdatableIndexSetting' where
     where
       dropDuplicateAttrNames = NE.fromList . L.nubBy sameAttrName . NE.toList
       sameAttrName a b = nodeAttrFilterName a == nodeAttrFilterName b
+  shrink (UpdatableIndexSetting' x) = map UpdatableIndexSetting' (genericShrink x)
 
 main :: IO ()
 main = hspec $ do
@@ -1004,20 +1056,26 @@ main = hspec $ do
       _ <- insertData
       let firstTest = BulkTest "blah"
       let secondTest = BulkTest "bloo"
+      let thirdTest = BulkTest "graffle"
       let firstDoc = BulkIndex testIndex
                      testMapping (DocId "2") (toJSON firstTest)
       let secondDoc = BulkCreate testIndex
                      testMapping (DocId "3") (toJSON secondTest)
-      let stream = V.fromList [firstDoc, secondDoc]
+      let thirdDoc = BulkCreateEncoding testIndex
+                     testMapping (DocId "4") (toEncoding thirdTest)
+      let stream = V.fromList [firstDoc, secondDoc, thirdDoc]
       _ <- bulk stream
       _ <- refreshIndex testIndex
       fDoc <- getDocument testIndex testMapping (DocId "2")
       sDoc <- getDocument testIndex testMapping (DocId "3")
+      tDoc <- getDocument testIndex testMapping (DocId "4")
       let maybeFirst  = eitherDecode $ responseBody fDoc :: Either String (EsResult BulkTest)
       let maybeSecond = eitherDecode $ responseBody sDoc :: Either String (EsResult BulkTest)
+      let maybeThird = eitherDecode $ responseBody tDoc :: Either String (EsResult BulkTest)
       liftIO $ do
         fmap getSource maybeFirst `shouldBe` Right (Just firstTest)
         fmap getSource maybeSecond `shouldBe` Right (Just secondTest)
+        fmap getSource maybeThird `shouldBe` Right (Just thirdTest)
 
 
   describe "query API" $ do
@@ -1066,6 +1124,17 @@ main = hspec $ do
       liftIO $
         myTweet `shouldBe` Right exampleTweet
 
+    it "returns document for multi-match query with a custom tiebreaker" $ withTestEnv $ do
+      _ <- insertData
+      let tiebreaker = Just $ Tiebreaker 0.3
+          flds = [FieldName "user", FieldName "message"]
+          multiQuery' = mkMultiMatchQuery flds (QueryString "bitemyapp")
+          query =  QueryMultiMatchQuery $ multiQuery' { multiMatchQueryTiebreaker = tiebreaker }
+          search = mkSearch (Just query) Nothing
+      myTweet <- searchTweet search
+      liftIO $
+        myTweet `shouldBe` Right exampleTweet
+
     it "returns document for bool query" $ withTestEnv $ do
       _ <- insertData
       let innerQuery = QueryMatchQuery $
@@ -1099,6 +1168,21 @@ main = hspec $ do
       liftIO $
         myTweet `shouldBe` Right exampleTweet
 
+    it "returns document for for inline template query" $ withTestEnv $ do
+      _ <- insertData
+      let innerQuery = QueryMatchQuery $
+                         mkMatchQuery (FieldName "{{userKey}}")
+                                      (QueryString "{{bitemyappKey}}")
+          templateParams = TemplateQueryKeyValuePairs $ HM.fromList
+                            [ ("userKey", "user")
+                            , ("bitemyappKey", "bitemyapp")
+                            ]
+          templateQuery = QueryTemplateQueryInline $
+                            TemplateQueryInline innerQuery templateParams
+          search = mkSearch (Just templateQuery) Nothing
+      myTweet <- searchTweet search
+      liftIO $ myTweet `shouldBe` Right exampleTweet
+
 
   describe "sorting" $ do
     it "returns documents in the right order" $ withTestEnv $ do
@@ -1108,6 +1192,7 @@ main = hspec $ do
       let search = Search Nothing
                    Nothing (Just [sortSpec]) Nothing Nothing
                    False (From 0) (Size 10) SearchTypeQueryThenFetch Nothing Nothing
+                   Nothing
       result <- searchTweets search
       let myTweet = grabFirst result
       liftIO $
@@ -1143,6 +1228,21 @@ main = hspec $ do
       res <- searchTweets search'
       liftIO $
         fmap aggregations res `shouldBe` Right (Just (M.fromList [ docCountPair "users" 1]))
+
+    it "returns stats aggregation results" $ withTestEnv $ do
+      _ <- insertData
+      let stats = StatsAgg $ mkStatsAggregation $ FieldName "age"
+      let search = mkAggregateSearch Nothing $ mkAggregations "users" stats
+      let search' = search { Database.V5.Bloodhound.from = From 0, size = Size 0 }
+      searchExpectAggs search'
+      let statsAggRes k n = (k, object [ "max" .= Number n
+                                       , "avg" .= Number n
+                                       , "count" .= Number 1
+                                       , "min" .= Number n
+                                       , "sum" .= Number n])
+      res <- searchTweets search'
+      liftIO $
+        fmap aggregations res `shouldBe` Right (Just (M.fromList [ statsAggRes "users" 10000]))
 
     it "can give collection hint parameters to term aggregations" $ when' (atleast es13) $ withTestEnv $ do
       _ <- insertData
@@ -1488,11 +1588,11 @@ main = hspec $ do
         scan_search `shouldMatchList` [Just exampleTweet, Just otherTweet]
 
   describe "index aliases" $ do
+    let aname = IndexAliasName (IndexName "bloodhound-tests-twitter-1-alias")
+    let alias = IndexAlias (testIndex) aname
+    let create = IndexAliasCreate Nothing Nothing
+    let action = AddAlias alias create
     it "handles the simple case of aliasing an existing index" $ do
-      let alias = IndexAlias (testIndex) (IndexAliasName (IndexName "bloodhound-tests-twitter-1-alias"))
-      let create = IndexAliasCreate Nothing Nothing
-      let action = AddAlias alias create
-
       withTestEnv $ do
         resetIndex
         resp <- updateIndexAliases (action :| [])
@@ -1504,6 +1604,18 @@ main = hspec $ do
             Right (IndexAliasesSummary summs) ->
               L.find ((== alias) . indexAliasSummaryAlias) summs `shouldBe` Just expected
             Left e -> expectationFailure ("Expected an IndexAliasesSummary but got " <> show e)) `finally` cleanup
+    it "allows alias deletion" $ do
+      aliases <- withTestEnv $ do
+        resetIndex
+        resp <- updateIndexAliases (action :| [])
+        liftIO $ validateStatus resp 200
+        deleteIndexAlias aname
+        getIndexAliases
+      let expected = IndexAliasSummary alias create
+      case aliases of
+        Right (IndexAliasesSummary summs) ->
+          L.find ((== aname) . indexAlias . indexAliasSummaryAlias) summs `shouldBe` Nothing
+        Left e -> expectationFailure ("Expected an IndexAliasesSummary but got " <> show e)
 
   describe "Index Listing" $ do
     it "returns a list of index names" $ withTestEnv $ do
@@ -1525,11 +1637,97 @@ main = hspec $ do
                                     (IndexSettings (ShardCount 1) (ReplicaCount 0))
                                     (NE.toList updates))
 
+    it "allows total fields to be set" $ when' (atleast es50) $ withTestEnv $ do
+      _ <- deleteExampleIndex
+      _ <- createExampleIndex
+      let updates = MappingTotalFieldsLimit 2500 :| []
+      updateResp <- updateIndexSettings updates testIndex
+      liftIO $ validateStatus updateResp 200
+      getResp <- getIndexSettings testIndex
+      liftIO $
+        getResp `shouldBe` Right (IndexSettingsSummary
+                                    testIndex
+                                    (IndexSettings (ShardCount 1) (ReplicaCount 0))
+                                    (NE.toList updates))
+
+    it "accepts customer analyzers" $ when' (atleast es50) $ withTestEnv $ do
+      _ <- deleteExampleIndex
+      let analysis = Analysis
+            (M.singleton "ex_analyzer"
+              ( AnalyzerDefinition
+                (Just (Tokenizer "ex_tokenizer"))
+                (map TokenFilter
+                  [ "ex_filter_lowercase","ex_filter_uppercase","ex_filter_apostrophe"
+                  , "ex_filter_reverse","ex_filter_snowball"
+                  , "ex_filter_shingle"
+                  ]
+                )
+              )
+            )
+            (M.singleton "ex_tokenizer"
+              ( TokenizerDefinitionNgram
+                ( Ngram 3 4 [TokenLetter,TokenDigit])
+              )
+            )
+            (M.fromList
+              [ ("ex_filter_lowercase",TokenFilterDefinitionLowercase (Just Greek))
+              , ("ex_filter_uppercase",TokenFilterDefinitionUppercase Nothing)
+              , ("ex_filter_apostrophe",TokenFilterDefinitionApostrophe)
+              , ("ex_filter_reverse",TokenFilterDefinitionReverse)
+              , ("ex_filter_snowball",TokenFilterDefinitionSnowball English)
+              , ("ex_filter_shingle",TokenFilterDefinitionShingle (Shingle 3 3 True False " " "_"))
+              ]
+            )
+          updates = [AnalysisSetting analysis]
+      createResp <- createIndexWith (updates ++ [NumberOfReplicas (ReplicaCount 0)]) 1 testIndex
+      liftIO $ validateStatus createResp 200
+      getResp <- getIndexSettings testIndex
+      liftIO $
+        getResp `shouldBe` Right (IndexSettingsSummary
+                                    testIndex
+                                    (IndexSettings (ShardCount 1) (ReplicaCount 0))
+                                    updates
+                                 )
+
+    it "accepts default compression codec" $ when' (atleast es50) $ withTestEnv $ do
+      _ <- deleteExampleIndex
+      let updates = [CompressionSetting CompressionDefault]
+      createResp <- createIndexWith (updates ++ [NumberOfReplicas (ReplicaCount 0)]) 1 testIndex
+      liftIO $ validateStatus createResp 200
+      getResp <- getIndexSettings testIndex
+      liftIO $ getResp `shouldBe` Right
+        (IndexSettingsSummary testIndex (IndexSettings (ShardCount 1) (ReplicaCount 0)) updates)
+
+    it "accepts best compression codec" $ when' (atleast es50) $ withTestEnv $ do
+      _ <- deleteExampleIndex
+      let updates = [CompressionSetting CompressionBest]
+      createResp <- createIndexWith (updates ++ [NumberOfReplicas (ReplicaCount 0)]) 1 testIndex
+      liftIO $ validateStatus createResp 200
+      getResp <- getIndexSettings testIndex
+      liftIO $ getResp `shouldBe` Right
+        (IndexSettingsSummary testIndex (IndexSettings (ShardCount 1) (ReplicaCount 0)) updates)
+
+
   describe "Index Optimization" $ do
     it "returns a successful response upon completion" $ withTestEnv $ do
       _ <- createExampleIndex
       resp <- forceMergeIndex (IndexList (testIndex :| [])) defaultForceMergeIndexSettings
       liftIO $ validateStatus resp 200
+
+  describe "Suggest" $ do
+    it "returns a search suggestion using the phrase suggester" $ withTestEnv $ do
+      _ <- insertData
+      let query = QueryMatchNoneQuery
+          phraseSuggester = mkPhraseSuggester (FieldName "message")
+          namedSuggester = Suggest "Use haskel" "suggest_name" (SuggestTypePhraseSuggester phraseSuggester)
+          search' = mkSearch (Just query) Nothing
+          search = search' { suggestBody = Just namedSuggester }
+          expectedText = Just "use haskell"
+      resp <- searchByIndex testIndex search
+      parsed <- parseEsResponse resp :: BH IO (Either EsError (SearchResult Tweet))
+      case parsed of
+        Left e -> liftIO $ expectationFailure ("Expected an search suggestion but got " <> show e)
+        Right sr -> liftIO $ (suggestOptionsText . head . suggestResponseOptions . head . nsrResponses  <$> suggest sr) `shouldBe` expectedText
 
   describe "JSON instances" $ do
     propJSON (Proxy :: Proxy Version)
@@ -1633,6 +1831,10 @@ main = hspec $ do
     propJSON (Proxy :: Proxy InitialShardCount)
     propJSON (Proxy :: Proxy FSType)
     propJSON (Proxy :: Proxy CompoundFormat)
+    propJSON (Proxy :: Proxy TemplateQueryInline)
+    propJSON (Proxy :: Proxy Suggest)
+    propJSON (Proxy :: Proxy DirectGenerators)
+    propJSON (Proxy :: Proxy DirectGeneratorSuggestModeTypes)
 
 -- Temporary solution for lacking of generic derivation of Arbitrary
 -- We use generics-sop, as it's much more concise than directly using GHC.Generics

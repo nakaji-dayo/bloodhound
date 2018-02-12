@@ -47,6 +47,8 @@ module Database.V5.Bloodhound.Types
        , mkDateHistogram
        , mkCardinalityAggregation
        , mkDocVersion
+       , mkStatsAggregation
+       , mkExtendedStatsAggregation
        , docVersionNumber
        , toMissing
        , toTerms
@@ -72,6 +74,7 @@ module Database.V5.Bloodhound.Types
        , UpdatableIndexSetting(..)
        , IndexSettingsSummary(..)
        , AllocationPolicy(..)
+       , Compression(..)
        , ReplicaBounds(..)
        , Bytes(..)
        , gigabytes
@@ -194,10 +197,14 @@ module Database.V5.Bloodhound.Types
        , RangeQuery(..)
        , RegexpQuery(..)
        , QueryString(..)
+       , TemplateQueryInline(..)
+       , TemplateQueryKeyValuePairs(..)
        , BooleanOperator(..)
        , ZeroTermsQuery(..)
        , CutoffFrequency(..)
        , Analyzer(..)
+       , Tokenizer(..)
+       , TokenFilter(..)
        , MaxExpansions(..)
        , Lenient(..)
        , MatchQueryType(..)
@@ -321,6 +328,18 @@ module Database.V5.Bloodhound.Types
        , rrGroupRefNum
        , mkRRGroupRefNum
        , RestoreIndexSettings(..)
+       , Suggest(..)
+       , SuggestType(..)
+       , PhraseSuggester(..)
+       , PhraseSuggesterHighlighter(..)
+       , PhraseSuggesterCollate(..)
+       , mkPhraseSuggester
+       , SuggestOptions(..)
+       , SuggestResponse(..)
+       , NamedSuggestionResponse(..)
+       , DirectGenerators(..)
+       , mkDirectGenerators
+       , DirectGeneratorSuggestModeTypes (..)
 
        , Aggregation(..)
        , Aggregations
@@ -341,6 +360,7 @@ module Database.V5.Bloodhound.Types
        , DateMathModifier(..)
        , DateMathUnit(..)
        , TopHitsAggregation(..)
+       , StatisticsAggregation(..)
 
        , Highlights(..)
        , FieldHighlight(..)
@@ -362,6 +382,15 @@ module Database.V5.Bloodhound.Types
 
        , EsUsername(..)
        , EsPassword(..)
+
+       , Analysis(..)
+       , AnalyzerDefinition(..)
+       , TokenizerDefinition(..)
+       , TokenFilterDefinition(..)
+       , Ngram(..)
+       , TokenChar(..)
+       , Shingle(..)
+       , Language(..)
          ) where
 
 import           Control.Applicative                   as A
@@ -375,7 +404,8 @@ import           Control.Monad.Writer                  (MonadWriter)
 import           Data.Aeson
 import           Data.Aeson.Types                      (Pair, Parser,
                                                         emptyObject,
-                                                        parseEither, parseMaybe)
+                                                        parseEither, parseMaybe,
+                                                        typeMismatch)
 import qualified Data.ByteString.Lazy.Char8            as L
 import           Data.Char
 import           Data.Hashable                         (Hashable)
@@ -564,10 +594,305 @@ data UpdatableIndexSetting = NumberOfReplicas ReplicaCount
                            | TTLDisablePurge Bool
                            -- ^ Disables temporarily the purge of expired docs.
                            | TranslogFSType FSType
+                           | CompressionSetting Compression
                            | IndexCompoundFormat CompoundFormat
                            | IndexCompoundOnFlush Bool
                            | WarmerEnabled Bool
+                           | MappingTotalFieldsLimit Int
+                           | AnalysisSetting Analysis
+                           -- ^ Analysis is not a dynamic setting and can only be performed on a closed index.
                            deriving (Eq, Show, Generic, Typeable)
+
+data Analysis = Analysis
+  { analysisAnalyzer :: M.Map Text AnalyzerDefinition
+  , analysisTokenizer :: M.Map Text TokenizerDefinition
+  , analysisTokenFilter :: M.Map Text TokenFilterDefinition
+  } deriving (Eq,Show,Generic,Typeable)
+
+instance ToJSON Analysis where
+  toJSON (Analysis analyzer tokenizer tokenFilter) = object
+    [ "analyzer" .= analyzer
+    , "tokenizer" .= tokenizer
+    , "filter" .= tokenFilter
+    ]
+
+instance FromJSON Analysis where
+  parseJSON = withObject "Analysis" $ \m -> Analysis
+    <$> m .: "analyzer"
+    <*> m .:? "tokenizer" .!= M.empty
+    <*> m .:? "filter" .!= M.empty
+
+data AnalyzerDefinition = AnalyzerDefinition
+  { analyzerDefinitionTokenizer :: Maybe Tokenizer
+  , analyzerDefinitionFilter :: [TokenFilter]
+  } deriving (Eq,Show,Generic,Typeable)
+
+instance ToJSON AnalyzerDefinition where
+  toJSON (AnalyzerDefinition tokenizer tokenFilter) = object $ catMaybes
+    [ fmap ("tokenizer" .=) tokenizer
+    , Just $ "filter" .= tokenFilter
+    ]
+
+instance FromJSON AnalyzerDefinition where
+  parseJSON = withObject "AnalyzerDefinition" $ \m -> AnalyzerDefinition
+    <$> m .:? "tokenizer"
+    <*> m .:? "filter" .!= []
+  
+-- | Token filters are used to create custom analyzers.
+data TokenFilterDefinition
+  = TokenFilterDefinitionLowercase (Maybe Language)
+  | TokenFilterDefinitionUppercase (Maybe Language)
+  | TokenFilterDefinitionApostrophe
+  | TokenFilterDefinitionReverse
+  | TokenFilterDefinitionSnowball Language
+  | TokenFilterDefinitionShingle Shingle
+  deriving (Eq,Show,Generic)
+
+instance ToJSON TokenFilterDefinition where
+  toJSON x = case x of
+    TokenFilterDefinitionLowercase mlang -> object $ catMaybes
+      [ Just $ "type" .= ("lowercase" :: Text)
+      , fmap (\lang -> "language" .= languageToText lang) mlang
+      ]
+    TokenFilterDefinitionUppercase mlang -> object $ catMaybes
+      [ Just $ "type" .= ("uppercase" :: Text)
+      , fmap (\lang -> "language" .= languageToText lang) mlang
+      ]
+    TokenFilterDefinitionApostrophe -> object
+      [ "type" .= ("apostrophe" :: Text)
+      ]
+    TokenFilterDefinitionReverse -> object
+      [ "type" .= ("reverse" :: Text)
+      ]
+    TokenFilterDefinitionSnowball lang -> object
+      [ "type" .= ("snowball" :: Text)
+      , "language" .= languageToText lang
+      ]
+    TokenFilterDefinitionShingle s -> object
+      [ "type" .= ("shingle" :: Text)
+      , "max_shingle_size" .= shingleMaxSize s
+      , "min_shingle_size" .= shingleMinSize s
+      , "output_unigrams" .= shingleOutputUnigrams s
+      , "output_unigrams_if_no_shingles" .= shingleOutputUnigramsIfNoShingles s
+      , "token_separator" .= shingleTokenSeparator s
+      , "filler_token" .= shingleFillerToken s
+      ]
+
+instance FromJSON TokenFilterDefinition where
+  parseJSON = withObject "TokenFilterDefinition" $ \m -> do
+    t <- m .: "type"
+    case (t :: Text) of
+      "reverse" -> return TokenFilterDefinitionReverse
+      "apostrophe" -> return TokenFilterDefinitionApostrophe
+      "lowercase" -> TokenFilterDefinitionLowercase
+        <$> m .:? "language"
+      "uppercase" -> TokenFilterDefinitionUppercase
+        <$> m .:? "language"
+      "snowball" -> TokenFilterDefinitionSnowball
+        <$> m .: "language"
+      "shingle" -> fmap TokenFilterDefinitionShingle $ Shingle
+        <$> (fmap.fmap) unStringlyTypedInt (m .:? "max_shingle_size") .!= 2
+        <*> (fmap.fmap) unStringlyTypedInt (m .:? "min_shingle_size") .!= 2
+        <*> (fmap.fmap) unStringlyTypedBool (m .:? "output_unigrams") .!= True
+        <*> (fmap.fmap) unStringlyTypedBool (m .:? "output_unigrams_if_no_shingles") .!= False
+        <*> m .:? "token_separator" .!= " "
+        <*> m .:? "filler_token" .!= "_"
+      _ -> fail ("unrecognized token filter type: " ++ T.unpack t)
+
+-- | The set of languages that can be passed to various analyzers,
+--   filters, etc. in ElasticSearch. Most data types in this module
+--   that have a 'Language' field are actually only actually to
+--   handle a subset of these languages. Consult the official
+--   ElasticSearch documentation to see what is actually supported.
+data Language
+  = Arabic
+  | Armenian
+  | Basque
+  | Bengali
+  | Brazilian
+  | Bulgarian
+  | Catalan
+  | Cjk
+  | Czech
+  | Danish
+  | Dutch
+  | English
+  | Finnish
+  | French
+  | Galician
+  | German
+  | German2
+  | Greek
+  | Hindi
+  | Hungarian
+  | Indonesian
+  | Irish
+  | Italian
+  | Kp
+  | Latvian
+  | Lithuanian
+  | Lovins
+  | Norwegian
+  | Persian
+  | Porter
+  | Portuguese
+  | Romanian
+  | Russian
+  | Sorani
+  | Spanish
+  | Swedish
+  | Thai
+  | Turkish
+  deriving (Show,Eq,Generic)
+
+instance ToJSON Language where
+  toJSON = Data.Aeson.String . languageToText
+
+instance FromJSON Language where
+  parseJSON = withText "Language" $ \t -> case languageFromText t of
+    Nothing -> fail "not a supported ElasticSearch language"
+    Just lang -> return lang
+
+languageToText :: Language -> Text
+languageToText x = case x of
+  Arabic -> "arabic"
+  Armenian -> "armenian"
+  Basque -> "basque"
+  Bengali -> "bengali"
+  Brazilian -> "brazilian"
+  Bulgarian -> "bulgarian"
+  Catalan -> "catalan"
+  Cjk -> "cjk"
+  Czech -> "czech"
+  Danish -> "danish"
+  Dutch -> "dutch"
+  English -> "english"
+  Finnish -> "finnish"
+  French -> "french"
+  Galician -> "galician"
+  German -> "german"
+  German2 -> "german2"
+  Greek -> "greek"
+  Hindi -> "hindi"
+  Hungarian -> "hungarian"
+  Indonesian -> "indonesian"
+  Irish -> "irish"
+  Italian -> "italian"
+  Kp -> "kp"
+  Latvian -> "latvian"
+  Lithuanian -> "lithuanian"
+  Lovins -> "lovins"
+  Norwegian -> "norwegian"
+  Persian -> "persian"
+  Porter -> "porter"
+  Portuguese -> "portuguese"
+  Romanian -> "romanian"
+  Russian -> "russian"
+  Sorani -> "sorani"
+  Spanish -> "spanish"
+  Swedish -> "swedish"
+  Thai -> "thai"
+  Turkish -> "turkish"
+
+languageFromText :: Text -> Maybe Language
+languageFromText x = case x of
+  "arabic" -> Just Arabic
+  "armenian" -> Just Armenian
+  "basque" -> Just Basque
+  "bengali" -> Just Bengali
+  "brazilian" -> Just Brazilian
+  "bulgarian" -> Just Bulgarian
+  "catalan" -> Just Catalan
+  "cjk" -> Just Cjk
+  "czech" -> Just Czech
+  "danish" -> Just Danish
+  "dutch" -> Just Dutch
+  "english" -> Just English
+  "finnish" -> Just Finnish
+  "french" -> Just French
+  "galician" -> Just Galician
+  "german" -> Just German
+  "german2" -> Just German2
+  "greek" -> Just Greek
+  "hindi" -> Just Hindi
+  "hungarian" -> Just Hungarian
+  "indonesian" -> Just Indonesian
+  "irish" -> Just Irish
+  "italian" -> Just Italian
+  "kp" -> Just Kp
+  "latvian" -> Just Latvian
+  "lithuanian" -> Just Lithuanian
+  "lovins" -> Just Lovins
+  "norwegian" -> Just Norwegian
+  "persian" -> Just Persian
+  "porter" -> Just Porter
+  "portuguese" -> Just Portuguese
+  "romanian" -> Just Romanian
+  "russian" -> Just Russian
+  "sorani" -> Just Sorani
+  "spanish" -> Just Spanish
+  "swedish" -> Just Swedish
+  "thai" -> Just Thai
+  "turkish" -> Just Turkish
+  _ -> Nothing
+
+data Shingle = Shingle
+  { shingleMaxSize :: Int
+  , shingleMinSize :: Int
+  , shingleOutputUnigrams :: Bool
+  , shingleOutputUnigramsIfNoShingles :: Bool
+  , shingleTokenSeparator :: Text
+  , shingleFillerToken :: Text
+  } deriving (Eq,Show,Generic,Typeable)
+
+data TokenizerDefinition
+  = TokenizerDefinitionNgram Ngram
+  deriving (Eq,Show,Generic,Typeable)
+
+instance ToJSON TokenizerDefinition where
+  toJSON x = case x of
+    TokenizerDefinitionNgram (Ngram minGram maxGram tokenChars) -> object
+      [ "type" .= ("ngram" :: Text)
+      , "min_gram" .= minGram
+      , "max_gram" .= maxGram
+      , "token_chars" .= tokenChars
+      ]
+
+instance FromJSON TokenizerDefinition where
+  parseJSON = withObject "TokenizerDefinition" $ \m -> do
+    typ <- m .: "type" :: Parser Text
+    case typ of
+      "ngram" -> fmap TokenizerDefinitionNgram $ Ngram
+        <$> (fmap unStringlyTypedInt (m .: "min_gram"))
+        <*> (fmap unStringlyTypedInt (m .: "max_gram"))
+        <*> m .: "token_chars"
+      _ -> fail "invalid TokenizerDefinition"
+
+data Ngram = Ngram
+  { ngramMinGram :: Int
+  , ngramMaxGram :: Int
+  , ngramTokenChars :: [TokenChar]
+  } deriving (Eq,Show,Generic,Typeable)
+
+data TokenChar = TokenLetter | TokenDigit | TokenWhitespace | TokenPunctuation | TokenSymbol
+  deriving (Eq,Read,Show,Generic,Typeable)
+
+instance ToJSON TokenChar where
+  toJSON t = String $ case t of
+    TokenLetter -> "letter"
+    TokenDigit -> "digit"
+    TokenWhitespace -> "whitespace"
+    TokenPunctuation -> "punctuation"
+    TokenSymbol -> "symbol"
+
+instance FromJSON TokenChar where
+  parseJSON = withText "TokenChar" $ \t -> case t of
+    "letter" -> return TokenLetter
+    "digit" -> return TokenDigit
+    "whitespace" -> return TokenWhitespace
+    "punctuation" -> return TokenPunctuation
+    "symbol" -> return TokenSymbol
+    _ -> fail "invalid TokenChar"
 
 data AllocationPolicy = AllocAll
                       -- ^ Allows shard allocation for all shards.
@@ -583,6 +908,26 @@ data ReplicaBounds = ReplicasBounded Int Int
                    | ReplicasLowerBounded Int
                    | ReplicasUnbounded
                    deriving (Eq, Read, Show, Generic, Typeable)
+
+data Compression
+  = CompressionDefault
+    -- ^ Compress with LZ4
+  | CompressionBest
+    -- ^ Compress with DEFLATE. Elastic
+    --   <https://www.elastic.co/blog/elasticsearch-storage-the-true-story-2.0 blogs>
+    --   that this can reduce disk use by 15%-25%.
+  deriving (Eq,Show,Generic,Typeable)
+
+instance ToJSON Compression where
+  toJSON x = case x of
+    CompressionDefault -> toJSON ("default" :: Text)
+    CompressionBest -> toJSON ("best_compression" :: Text)
+
+instance FromJSON Compression where
+  parseJSON = withText "Compression" $ \t -> case t of
+    "default" -> return CompressionDefault
+    "best_compression" -> return CompressionBest
+    _ -> fail "invalid compression codec"
 
 -- | A measure of bytes used for various configurations. You may want
 -- to use smart constructors like 'gigabytes' for larger values.
@@ -695,8 +1040,9 @@ data Mapping = Mapping { typeName      :: TypeName
 data BulkOperation =
     BulkIndex  IndexName MappingName DocId Value
   | BulkCreate IndexName MappingName DocId Value
+  | BulkCreateEncoding IndexName MappingName DocId Encoding
   | BulkDelete IndexName MappingName DocId
-  | BulkUpdate IndexName MappingName DocId Value deriving (Eq, Read, Show, Generic, Typeable)
+  | BulkUpdate IndexName MappingName DocId Value deriving (Eq, Show, Generic, Typeable)
 
 {-| 'EsResult' describes the standard wrapper JSON document that you see in
     successful Elasticsearch lookups or lookups that couldn't find the document.
@@ -907,7 +1253,7 @@ defaultCache = False
 
 {-| 'PrefixValue' is used in 'PrefixQuery' as the main query component.
 -}
-type PrefixValue = Text
+-- type PrefixValue = Text
 
 {-| 'BooleanOperator' is the usual And/Or operators with an ES compatible
     JSON encoding baked in. Used all over the place.
@@ -1003,6 +1349,10 @@ newtype CutoffFrequency =
   CutoffFrequency Double deriving (Eq, Read, Show, Generic, ToJSON, FromJSON, Typeable)
 newtype Analyzer =
   Analyzer Text deriving (Eq, Read, Show, Generic, ToJSON, FromJSON, Typeable)
+newtype Tokenizer =
+  Tokenizer Text deriving (Eq, Read, Show, Generic, ToJSON, FromJSON, Typeable)
+newtype TokenFilter =
+  TokenFilter Text deriving (Eq, Read, Show, Generic, ToJSON, FromJSON, Typeable)
 newtype MaxExpansions =
   MaxExpansions Int deriving (Eq, Read, Show, Generic, ToJSON, FromJSON, Typeable)
 
@@ -1092,7 +1442,7 @@ unpackId (DocId docId) = docId
 
 type TrackSortScores = Bool
 newtype From = From Int deriving (Eq, Read, Show, Generic, ToJSON)
-newtype Size = Size Int deriving (Eq, Read, Show, Generic, ToJSON)
+newtype Size = Size Int deriving (Eq, Read, Show, Generic, ToJSON, FromJSON)
 
 data Search = Search { queryBody       :: Maybe Query
                      , filterBody      :: Maybe Filter
@@ -1105,7 +1455,9 @@ data Search = Search { queryBody       :: Maybe Query
                      , size            :: Size
                      , searchType      :: SearchType
                      , fields          :: Maybe [FieldName]
-                     , source          :: Maybe Source } deriving (Eq, Read, Show, Generic, Typeable)
+                     , source          :: Maybe Source
+                     , suggestBody     :: Maybe Suggest -- ^ Only one Suggestion request / response per Search is supported.
+                     } deriving (Eq, Read, Show, Generic, Typeable)
 
 data SearchType = SearchTypeQueryThenFetch
                 | SearchTypeDfsQueryThenFetch
@@ -1208,6 +1560,7 @@ data Query =
   | QueryRegexpQuery            RegexpQuery
   | QueryExistsQuery            FieldName
   | QueryMatchNoneQuery
+  | QueryTemplateQueryInline    TemplateQueryInline
   deriving (Eq, Read, Show, Generic, Typeable)
 
 -- | As of Elastic 2.0, 'Filters' are just 'Queries' housed in a Bool Query, and
@@ -1418,13 +1771,15 @@ data MatchQuery =
              , matchQueryAnalyzer        :: Maybe Analyzer
              , matchQueryMaxExpansions   :: Maybe MaxExpansions
              , matchQueryLenient         :: Maybe Lenient
-             , matchQueryBoost           :: Maybe Boost } deriving (Eq, Read, Show, Generic, Typeable)
+             , matchQueryBoost           :: Maybe Boost
+             , matchQueryMinimumShouldMatch :: Maybe Text
+             } deriving (Eq, Read, Show, Generic, Typeable)
 
 {-| 'mkMatchQuery' is a convenience function that defaults the less common parameters,
     enabling you to provide only the 'FieldName' and 'QueryString' to make a 'MatchQuery'
 -}
 mkMatchQuery :: FieldName -> QueryString -> MatchQuery
-mkMatchQuery field query = MatchQuery field query Or ZeroTermsNone Nothing Nothing Nothing Nothing Nothing Nothing
+mkMatchQuery field query = MatchQuery field query Or ZeroTermsNone Nothing Nothing Nothing Nothing Nothing Nothing Nothing
 
 data MatchQueryType =
   MatchPhrase
@@ -1619,13 +1974,49 @@ data DistanceRange =
   DistanceRange { distanceFrom :: Distance
                 , distanceTo   :: Distance } deriving (Eq, Read, Show, Generic, Typeable)
 
+type TemplateQueryKey = Text
+type TemplateQueryValue = Text
+
+newtype TemplateQueryKeyValuePairs = TemplateQueryKeyValuePairs (HM.HashMap TemplateQueryKey TemplateQueryValue)
+  deriving (Eq, Read, Show, Generic)
+
+instance ToJSON TemplateQueryKeyValuePairs where
+  toJSON (TemplateQueryKeyValuePairs x) = Object $ HM.map toJSON x
+
+instance FromJSON TemplateQueryKeyValuePairs where
+  parseJSON (Object o) = pure . TemplateQueryKeyValuePairs $ HM.mapMaybe getValue o
+    where getValue (String x) = Just x
+          getValue _          = Nothing
+  parseJSON _          = fail "error parsing TemplateQueryKeyValuePairs"
+
+data TemplateQueryInline =
+  TemplateQueryInline { inline :: Query
+                      , params :: TemplateQueryKeyValuePairs
+                      }
+  deriving (Eq, Read, Show, Generic, Typeable)
+
+instance ToJSON TemplateQueryInline where
+  toJSON TemplateQueryInline{..} = object [ "inline" .= inline
+                                          , "params" .= params
+                                          ]
+
+instance FromJSON TemplateQueryInline where
+  parseJSON = withObject "TemplateQueryInline" parse
+    where parse o = TemplateQueryInline
+                    <$> o .: "inline"
+                    <*> o .: "params"
+
+
 data SearchResult a =
   SearchResult { took         :: Int
                , timedOut     :: Bool
                , shards       :: ShardResult
                , searchHits   :: SearchHits a
                , aggregations :: Maybe AggregationResults
-               , scrollId     :: Maybe ScrollId } deriving (Eq, Read, Show, Generic, Typeable)
+               , scrollId     :: Maybe ScrollId
+               , suggest      :: Maybe NamedSuggestionResponse -- ^ Only one Suggestion request / response per Search is supported.
+               }
+  deriving (Eq, Read, Show, Generic, Typeable)
 
 newtype ScrollId = ScrollId Text deriving (Eq, Read, Show, Generic, Ord, ToJSON, FromJSON)
 
@@ -1715,6 +2106,7 @@ data Aggregation = TermsAgg TermsAggregation
                  | DateRangeAgg DateRangeAggregation
                  | MissingAgg MissingAggregation
                  | TopHitsAgg TopHitsAggregation
+                 | StatsAgg StatisticsAggregation
   deriving (Eq, Read, Show, Generic, Typeable)
 
 data TopHitsAggregation = TopHitsAggregation
@@ -1792,6 +2184,14 @@ data ValueCountAggregation = FieldValueCount FieldName
 data FilterAggregation = FilterAggregation { faFilter :: Filter
                                            , faAggs   :: Maybe Aggregations} deriving (Eq, Read, Show, Generic, Typeable)
 
+data StatisticsAggregation = StatisticsAggregation { statsType :: StatsType
+                                                   , statsField :: FieldName } deriving (Eq, Read, Show, Generic, Typeable)
+
+data StatsType
+  = Basic
+  | Extended
+  deriving (Eq, Read, Show, Generic, Typeable)
+
 mkTermsAggregation :: Text -> TermsAggregation
 mkTermsAggregation t = TermsAggregation (Left t) Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
 
@@ -1803,6 +2203,12 @@ mkDateHistogram t i = DateHistogramAggregation t i Nothing Nothing Nothing Nothi
 
 mkCardinalityAggregation :: FieldName -> CardinalityAggregation
 mkCardinalityAggregation t = CardinalityAggregation t Nothing
+
+mkStatsAggregation :: FieldName -> StatisticsAggregation
+mkStatsAggregation = StatisticsAggregation Basic
+
+mkExtendedStatsAggregation :: FieldName -> StatisticsAggregation
+mkExtendedStatsAggregation = StatisticsAggregation Extended
 
 instance ToJSON Version where
   toJSON Version {..} = object ["number" .= number
@@ -1928,6 +2334,12 @@ instance ToJSON Aggregation where
                                        ]
               ]
 
+  toJSON (StatsAgg (StatisticsAggregation typ field)) =
+    object [stType .= omitNulls [ "field" .= field ]]
+    where
+      stType | typ == Basic = "stats"
+             | otherwise = "extended_stats"
+
 instance ToJSON DateRangeAggregation where
   toJSON DateRangeAggregation {..} =
     omitNulls [ "field" .= draField
@@ -2023,7 +2435,7 @@ instance BucketAggregation DateRangeResult where
   docCount = dateRangeDocCount
   aggs = dateRangeAggs
 
-instance (FromJSON a, BucketAggregation a) => FromJSON (Bucket a) where
+instance (FromJSON a) => FromJSON (Bucket a) where
   parseJSON (Object v) = Bucket <$>
                          v .: "buckets"
   parseJSON _ = mempty
@@ -2196,6 +2608,9 @@ instance ToJSON Query where
   toJSON QueryMatchNoneQuery =
     object ["match_none" .= object []]
 
+  toJSON (QueryTemplateQueryInline templateQuery) =
+    object [ "template" .= templateQuery ]
+
 instance FromJSON Query where
   parseJSON v = withObject "Query" parse v
     where parse o = termQuery `taggedWith` "term"
@@ -2223,6 +2638,7 @@ instance FromJSON Query where
                 <|> queryRangeQuery `taggedWith` "range"
                 <|> queryRegexpQuery `taggedWith` "regexp"
                 <|> querySimpleQueryStringQuery `taggedWith` "simple_query_string"
+                <|> queryTemplateQueryInline `taggedWith` "template"
             where taggedWith parser k = parser =<< o .: k
           termQuery = fieldTagged $ \(FieldName fn) o ->
                         TermQuery <$> (Term fn <$> o .: "value") <*> o .:? "boost"
@@ -2259,7 +2675,8 @@ instance FromJSON Query where
           queryRangeQuery = pure . QueryRangeQuery
           queryRegexpQuery = pure . QueryRegexpQuery
           querySimpleQueryStringQuery = pure . QuerySimpleQueryStringQuery
-          queryExistsQuery o = QueryExistsQuery <$> o .: "field"
+          -- queryExistsQuery o = QueryExistsQuery <$> o .: "field"
+          queryTemplateQueryInline = pure . QueryTemplateQueryInline
 
 
 omitNulls :: [(Text, Value)] -> Value
@@ -2727,10 +3144,10 @@ instance FromJSON BoostingQuery where
                     <*> o .: "negative_boost"
 
 instance ToJSON BoolQuery where
-  toJSON (BoolQuery mustM filterM notM shouldM bqMin boost disableCoord) =
+  toJSON (BoolQuery mustM filterM' notM shouldM bqMin boost disableCoord) =
     omitNulls base
     where base = [ "must" .= mustM
-                 , "filter" .= filterM
+                 , "filter" .= filterM'
                  , "must_not" .= notM
                  , "should" .= shouldM
                  , "minimum_should_match" .= bqMin
@@ -2752,7 +3169,9 @@ instance ToJSON MatchQuery where
   toJSON (MatchQuery (FieldName fieldName)
           (QueryString mqQueryString) booleanOperator
           zeroTermsQuery cutoffFrequency matchQueryType
-          analyzer maxExpansions lenient boost) =
+          analyzer maxExpansions lenient boost
+          minShouldMatch
+         ) =
     object [ fieldName .= omitNulls base ]
     where base = [ "query" .= mqQueryString
                  , "operator" .= booleanOperator
@@ -2762,7 +3181,9 @@ instance ToJSON MatchQuery where
                  , "analyzer" .= analyzer
                  , "max_expansions" .= maxExpansions
                  , "lenient" .= lenient
-                 , "boost" .= boost ]
+                 , "boost" .= boost
+                 , "minimum_should_match" .= minShouldMatch
+                 ]
 
 instance FromJSON MatchQuery where
   parseJSON = withObject "MatchQuery" parse
@@ -2777,6 +3198,7 @@ instance FromJSON MatchQuery where
                     <*> o .:? "max_expansions"
                     <*> o .:? "lenient"
                     <*> o .:? "boost"
+                    <*> o .:? "minimum_should_match"
 
 instance ToJSON MultiMatchQuery where
   toJSON (MultiMatchQuery fields (QueryString query) boolOp
@@ -2786,7 +3208,7 @@ instance ToJSON MultiMatchQuery where
                  , "query" .= query
                  , "operator" .= boolOp
                  , "zero_terms_query" .= ztQ
-                 , "tiebreaker" .= tb
+                 , "tie_breaker" .= tb
                  , "type" .= mmqt
                  , "cutoff_frequency" .= cf
                  , "analyzer" .= analyzer
@@ -2801,7 +3223,7 @@ instance FromJSON MultiMatchQuery where
                            <*> o .: "query"
                            <*> o .: "operator"
                            <*> o .: "zero_terms_query"
-                           <*> o .:? "tiebreaker"
+                           <*> o .:? "tie_breaker"
                            <*> o .:? "type"
                            <*> o .:? "cutoff_frequency"
                            <*> o .:? "analyzer"
@@ -2900,6 +3322,7 @@ instance ToJSON UpdatableIndexSetting where
   toJSON (GCDeletes x) = oPath ("index" :| ["gc_deletes"]) (NominalDiffTimeJSON x)
   toJSON (TTLDisablePurge x) = oPath ("index" :| ["ttl", "disable_purge"]) x
   toJSON (TranslogFSType x) = oPath ("index" :| ["translog", "fs", "type"]) x
+  toJSON (CompressionSetting x) = oPath ("index" :| ["codec"]) x
   toJSON (IndexCompoundFormat x) = oPath ("index" :| ["compound_format"]) x
   toJSON (IndexCompoundOnFlush x) = oPath ("index" :| ["compound_on_flush"]) x
   toJSON (WarmerEnabled x) = oPath ("index" :| ["warmer", "enabled"]) x
@@ -2907,6 +3330,8 @@ instance ToJSON UpdatableIndexSetting where
   toJSON (BlocksRead x) = oPath ("blocks" :| ["read"]) x
   toJSON (BlocksWrite x) = oPath ("blocks" :| ["write"]) x
   toJSON (BlocksMetaData x) = oPath ("blocks" :| ["metadata"]) x
+  toJSON (MappingTotalFieldsLimit x) = oPath ("index" :| ["mapping","total_fields","limit"]) x
+  toJSON (AnalysisSetting x) = oPath ("index" :| ["analysis"]) x
 
 instance FromJSON UpdatableIndexSetting where
   parseJSON = withObject "UpdatableIndexSetting" parse
@@ -2931,6 +3356,7 @@ instance FromJSON UpdatableIndexSetting where
                 <|> gcDeletes `taggedAt` ["index", "gc_deletes"]
                 <|> ttlDisablePurge `taggedAt` ["index", "ttl", "disable_purge"]
                 <|> translogFSType `taggedAt` ["index", "translog", "fs", "type"]
+                <|> compressionSetting `taggedAt` ["index", "codec"]
                 <|> compoundFormat `taggedAt` ["index", "compound_format"]
                 <|> compoundOnFlush `taggedAt` ["index", "compound_on_flush"]
                 <|> warmerEnabled `taggedAt` ["index", "warmer", "enabled"]
@@ -2938,6 +3364,8 @@ instance FromJSON UpdatableIndexSetting where
                 <|> blocksRead `taggedAt` ["blocks", "read"]
                 <|> blocksWrite `taggedAt` ["blocks", "write"]
                 <|> blocksMetaData `taggedAt` ["blocks", "metadata"]
+                <|> mappingTotalFieldsLimit `taggedAt` ["index", "mapping", "total_fields", "limit"]
+                <|> analysisSetting `taggedAt` ["index", "analysis"]
             where taggedAt f ks = taggedAt' f (Object o) ks
           taggedAt' f v [] = f =<< (parseJSON v <|> (parseJSON (unStringlyTypeJSON v)))
           taggedAt' f v (k:ks) = withObject "Object" (\o -> do v' <- o .: k
@@ -2963,6 +3391,7 @@ instance FromJSON UpdatableIndexSetting where
           gcDeletes                      = pure . GCDeletes . ndtJSON
           ttlDisablePurge                = pure . TTLDisablePurge
           translogFSType                 = pure . TranslogFSType
+          compressionSetting             = pure . CompressionSetting
           compoundFormat                 = pure . IndexCompoundFormat
           compoundOnFlush                = pure . IndexCompoundOnFlush
           warmerEnabled                  = pure . WarmerEnabled
@@ -2970,6 +3399,8 @@ instance FromJSON UpdatableIndexSetting where
           blocksRead                     = pure . BlocksRead
           blocksWrite                    = pure . BlocksWrite
           blocksMetaData                 = pure . BlocksMetaData
+          mappingTotalFieldsLimit        = pure . MappingTotalFieldsLimit
+          analysisSetting                = pure . AnalysisSetting
 
 instance FromJSON IndexSettingsSummary where
   parseJSON = withObject "IndexSettingsSummary" parse
@@ -3188,7 +3619,7 @@ instance FromJSON SearchAliasRouting where
     where parse t = SearchAliasRouting <$> parseNEJSON (String <$> T.splitOn "," t)
 
 instance ToJSON Search where
-  toJSON (Search mquery sFilter sort searchAggs highlight sTrackSortScores sFrom sSize _ sFields sSource) =
+  toJSON (Search mquery sFilter sort searchAggs highlight sTrackSortScores sFrom sSize _ sFields sSource sSuggest) =
     omitNulls [ "query"        .= query'
               , "sort"         .= sort
               , "aggregations" .= searchAggs
@@ -3197,7 +3628,8 @@ instance ToJSON Search where
               , "size"         .= sSize
               , "track_scores" .= sTrackSortScores
               , "fields"       .= sFields
-              , "_source"      .= sSource]
+              , "_source"      .= sSource
+              , "suggest"      .= sSuggest]
 
     where query' = case sFilter of
                     Nothing -> mquery
@@ -3550,7 +3982,8 @@ instance (FromJSON a) => FromJSON (SearchResult a) where
                          v .:  "_shards"      <*>
                          v .:  "hits"         <*>
                          v .:? "aggregations" <*>
-                         v .:? "_scroll_id"
+                         v .:? "_scroll_id"   <*>
+                         v .:? "suggest"
   parseJSON _          = empty
 
 instance (FromJSON a) => FromJSON (SearchHits a) where
@@ -4556,10 +4989,18 @@ instance FromJSON NodeDataPathStats where
 
 newtype StringlyTypedDouble = StringlyTypedDouble { unStringlyTypedDouble :: Double }
 
-
 instance FromJSON StringlyTypedDouble where
   parseJSON = fmap StringlyTypedDouble . parseJSON . unStringlyTypeJSON
 
+newtype StringlyTypedInt = StringlyTypedInt { unStringlyTypedInt :: Int }
+
+instance FromJSON StringlyTypedInt where
+  parseJSON = fmap StringlyTypedInt . parseJSON . unStringlyTypeJSON
+
+newtype StringlyTypedBool = StringlyTypedBool { unStringlyTypedBool :: Bool }
+
+instance FromJSON StringlyTypedBool where
+  parseJSON = fmap StringlyTypedBool . parseJSON . unStringlyTypeJSON
 
 instance FromJSON NodeFSTotalStats where
   parseJSON = withObject "NodeFSTotalStats" parse
@@ -5031,3 +5472,243 @@ newtype MaybeNA a = MaybeNA { unMaybeNA :: Maybe a }
 instance FromJSON a => FromJSON (MaybeNA a) where
   parseJSON (String "NA") = pure $ MaybeNA Nothing
   parseJSON o             = MaybeNA . Just <$> parseJSON o
+
+data Suggest = Suggest { suggestText :: Text
+                       , suggestName :: Text
+                       , suggestType :: SuggestType
+                       }
+ deriving (Show, Generic, Eq, Read)
+
+instance ToJSON Suggest where
+  toJSON Suggest{..} = object [ "text" .= suggestText
+                              , suggestName .= suggestType
+                              ]
+
+instance FromJSON Suggest where
+  parseJSON (Object o) = do
+    suggestText' <- o .: "text"
+    let dropTextList = HM.toList $ HM.filterWithKey (\x _ -> x /= "text") o
+    suggestName' <- case dropTextList of
+                        [(x, _)] -> return x
+                        _ -> fail "error parsing Suggest field name"
+    suggestType' <- o .: suggestName'
+    return $ Suggest suggestText' suggestName' suggestType'
+  parseJSON x = typeMismatch "Suggest" x
+
+data SuggestType = SuggestTypePhraseSuggester PhraseSuggester
+  deriving (Show, Generic, Eq, Read)
+
+instance ToJSON SuggestType where
+  toJSON (SuggestTypePhraseSuggester x) = object ["phrase" .= x]
+
+instance FromJSON SuggestType where
+  parseJSON = withObject "SuggestType" parse
+    where parse o = phraseSuggester `taggedWith` "phrase"
+           where taggedWith parser k = parser =<< o .: k
+                 phraseSuggester = pure . SuggestTypePhraseSuggester
+
+data PhraseSuggester =
+  PhraseSuggester { phraseSuggesterField :: FieldName
+                  , phraseSuggesterGramSize :: Maybe Int
+                  , phraseSuggesterRealWordErrorLikelihood :: Maybe Int
+                  , phraseSuggesterConfidence :: Maybe Int
+                  , phraseSuggesterMaxErrors :: Maybe Int
+                  , phraseSuggesterSeparator :: Maybe Text
+                  , phraseSuggesterSize :: Maybe Size
+                  , phraseSuggesterAnalyzer :: Maybe Analyzer
+                  , phraseSuggesterShardSize :: Maybe Int
+                  , phraseSuggesterHighlight :: Maybe PhraseSuggesterHighlighter
+                  , phraseSuggesterCollate :: Maybe PhraseSuggesterCollate
+                  , phraseSuggesterCandidateGenerators :: [DirectGenerators]
+                  }
+  deriving (Show, Generic, Eq, Read)
+
+instance ToJSON PhraseSuggester where
+  toJSON PhraseSuggester{..} = omitNulls [ "field" .= phraseSuggesterField
+                                         , "gram_size" .= phraseSuggesterGramSize
+                                         , "real_word_error_likelihood" .= phraseSuggesterRealWordErrorLikelihood
+                                         , "confidence" .= phraseSuggesterConfidence
+                                         , "max_errors" .= phraseSuggesterMaxErrors
+                                         , "separator" .= phraseSuggesterSeparator
+                                         , "size" .= phraseSuggesterSize
+                                         , "analyzer" .= phraseSuggesterAnalyzer
+                                         , "shard_size" .= phraseSuggesterShardSize
+                                         , "highlight" .= phraseSuggesterHighlight
+                                         , "collate" .= phraseSuggesterCollate
+                                         , "direct_generator" .= phraseSuggesterCandidateGenerators
+                                        ]
+
+instance FromJSON PhraseSuggester where
+  parseJSON = withObject "PhraseSuggester" parse
+    where parse o = PhraseSuggester
+                      <$> o .: "field"
+                      <*> o .:? "gram_size"
+                      <*> o .:? "real_word_error_likelihood"
+                      <*> o .:? "confidence"
+                      <*> o .:? "max_errors"
+                      <*> o .:? "separator"
+                      <*> o .:? "size"
+                      <*> o .:? "analyzer"
+                      <*> o .:? "shard_size"
+                      <*> o .:? "highlight"
+                      <*> o .:? "collate"
+                      <*> o .:? "direct_generator" .!= []
+
+mkPhraseSuggester :: FieldName -> PhraseSuggester
+mkPhraseSuggester fName =
+  PhraseSuggester fName Nothing Nothing Nothing Nothing Nothing Nothing
+    Nothing Nothing Nothing Nothing []
+
+data PhraseSuggesterHighlighter =
+  PhraseSuggesterHighlighter { phraseSuggesterHighlighterPreTag :: Text
+                             , phraseSuggesterHighlighterPostTag :: Text
+                             }
+  deriving (Show, Generic, Eq, Read)
+
+instance ToJSON PhraseSuggesterHighlighter where
+  toJSON PhraseSuggesterHighlighter{..} =
+            object [ "pre_tag" .= phraseSuggesterHighlighterPreTag
+                   , "post_tag" .= phraseSuggesterHighlighterPostTag
+                   ]
+
+instance FromJSON PhraseSuggesterHighlighter where
+  parseJSON = withObject "PhraseSuggesterHighlighter" parse
+    where parse o = PhraseSuggesterHighlighter
+                      <$> o .: "pre_tag"
+                      <*> o .: "post_tag"
+
+data PhraseSuggesterCollate =
+  PhraseSuggesterCollate { phraseSuggesterCollateTemplateQuery :: TemplateQueryInline
+                         , phraseSuggesterCollatePrune :: Bool
+                         }
+  deriving (Show, Generic, Eq, Read)
+
+instance ToJSON PhraseSuggesterCollate where
+  toJSON PhraseSuggesterCollate{..} = object [ "query" .= object
+                                              [ "inline" .= (inline phraseSuggesterCollateTemplateQuery)
+                                              ]
+                                             , "params" .= (params phraseSuggesterCollateTemplateQuery)
+                                             , "prune" .= phraseSuggesterCollatePrune
+                                             ]
+
+instance FromJSON PhraseSuggesterCollate where
+  parseJSON (Object o) = do
+    query' <- o .: "query"
+    inline' <- query' .: "inline"
+    params' <- o .: "params"
+    prune' <- o .:? "prune" .!= False
+    return $ PhraseSuggesterCollate (TemplateQueryInline inline' params') prune'
+  parseJSON x = typeMismatch "PhraseSuggesterCollate" x
+
+data SuggestOptions =
+  SuggestOptions { suggestOptionsText :: Text
+                 , suggestOptionsScore :: Double
+                 , suggestOptionsFreq :: Maybe Int
+                 , suggestOptionsHighlighted :: Maybe Text
+                 }
+  deriving (Eq, Read, Show)
+
+instance FromJSON SuggestOptions where
+  parseJSON = withObject "SuggestOptions" parse
+    where parse o = SuggestOptions
+                    <$> o .: "text"
+                    <*> o .: "score"
+                    <*> o .:? "freq"
+                    <*> o .:? "highlighted"
+
+data SuggestResponse =
+  SuggestResponse { suggestResponseText :: Text
+                  , suggestResponseOffset :: Int
+                  , suggestResponseLength :: Int
+                  , suggestResponseOptions :: [SuggestOptions]
+                  }
+  deriving (Eq, Read, Show)
+
+instance FromJSON SuggestResponse where
+  parseJSON = withObject "SuggestResponse" parse
+    where parse o = SuggestResponse
+                    <$> o .: "text"
+                    <*> o .: "offset"
+                    <*> o .: "length"
+                    <*> o .: "options"
+
+data NamedSuggestionResponse =
+  NamedSuggestionResponse { nsrName :: Text
+                          , nsrResponses :: [SuggestResponse]
+                          }
+  deriving (Eq, Read, Show)
+
+instance FromJSON NamedSuggestionResponse where
+  parseJSON (Object o) = do
+    suggestionName' <- case HM.toList o of
+                        [(x, _)] -> return x
+                        _ -> fail "error parsing NamedSuggestionResponse name"
+    suggestionResponses' <- o .: suggestionName'
+    return $ NamedSuggestionResponse suggestionName' suggestionResponses'
+
+  parseJSON x = typeMismatch "NamedSuggestionResponse" x
+
+data DirectGeneratorSuggestModeTypes = DirectGeneratorSuggestModeMissing
+                                | DirectGeneratorSuggestModePopular
+                                | DirectGeneratorSuggestModeAlways
+  deriving (Show, Eq, Read, Generic)
+
+instance ToJSON DirectGeneratorSuggestModeTypes where
+  toJSON DirectGeneratorSuggestModeMissing = "missing"
+  toJSON DirectGeneratorSuggestModePopular = "popular"
+  toJSON DirectGeneratorSuggestModeAlways = "always"
+
+instance FromJSON DirectGeneratorSuggestModeTypes where
+  parseJSON = withText "DirectGeneratorSuggestModeTypes" parse
+    where parse "missing"        = pure DirectGeneratorSuggestModeMissing
+          parse "popular"       = pure DirectGeneratorSuggestModePopular
+          parse "always"        = pure DirectGeneratorSuggestModeAlways
+          parse f            = fail ("Unexpected DirectGeneratorSuggestModeTypes: " <> show f)
+
+data DirectGenerators = DirectGenerators
+  { directGeneratorsField :: FieldName
+  , directGeneratorsSize :: Maybe Int
+  , directGeneratorSuggestMode :: DirectGeneratorSuggestModeTypes
+  , directGeneratorMaxEdits :: Maybe Double
+  , directGeneratorPrefixLength :: Maybe Int
+  , directGeneratorMinWordLength :: Maybe Int
+  , directGeneratorMaxInspections :: Maybe Int
+  , directGeneratorMinDocFreq :: Maybe Double
+  , directGeneratorMaxTermFreq :: Maybe Double
+  , directGeneratorPreFilter :: Maybe Text
+  , directGeneratorPostFilter :: Maybe Text
+  }
+  deriving (Show, Eq, Read, Generic)
+
+
+instance ToJSON DirectGenerators where
+  toJSON DirectGenerators{..} = omitNulls [ "field" .= directGeneratorsField
+                                         , "size" .= directGeneratorsSize
+                                         , "suggest_mode" .= directGeneratorSuggestMode
+                                         , "max_edits" .= directGeneratorMaxEdits
+                                         , "prefix_length" .= directGeneratorPrefixLength
+                                         , "min_word_length" .= directGeneratorMinWordLength
+                                         , "max_inspections" .= directGeneratorMaxInspections
+                                         , "min_doc_freq" .= directGeneratorMinDocFreq
+                                         , "max_term_freq" .= directGeneratorMaxTermFreq
+                                         , "pre_filter" .= directGeneratorPreFilter
+                                         , "post_filter" .= directGeneratorPostFilter
+                                        ]
+
+instance FromJSON DirectGenerators where
+  parseJSON = withObject "DirectGenerators" parse
+    where parse o = DirectGenerators
+                      <$> o .: "field"
+                      <*> o .:? "size"
+                      <*> o .:  "suggest_mode"
+                      <*> o .:? "max_edits"
+                      <*> o .:? "prefix_length"
+                      <*> o .:? "min_word_length"
+                      <*> o .:? "max_inspections"
+                      <*> o .:? "min_doc_freq"
+                      <*> o .:? "max_term_freq"
+                      <*> o .:? "pre_filter"
+                      <*> o .:? "post_filter"
+
+mkDirectGenerators :: FieldName -> DirectGenerators
+mkDirectGenerators fn = DirectGenerators fn Nothing DirectGeneratorSuggestModeMissing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing 
