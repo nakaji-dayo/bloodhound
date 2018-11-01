@@ -3,9 +3,9 @@
 
 module Database.Bloodhound.Common.Script where
 
-import Bloodhound.Import
+import           Bloodhound.Import
 
-import qualified Data.HashMap.Strict as HM
+import qualified Data.HashMap.Strict                      as HM
 
 import           Database.V5.Bloodhound.Internal.Newtypes
 
@@ -59,7 +59,27 @@ data FunctionScoreFunction =
     FunctionScoreFunctionScript Script
   | FunctionScoreFunctionRandom Seed
   | FunctionScoreFunctionFieldValueFactor FieldValueFactor
+  | FunctionScoreFunctionDecay DecayFunctionName DecayFunction
   deriving (Eq, Show)
+
+data DecayFunction =
+  DecayFunction { decayFunctionOrigin :: Maybe Origin
+                , decayFunctionScale  :: Maybe Scale
+                , decayFunctionOffset :: Maybe Offset
+                , decayFunctionDecay  :: Maybe Decay
+                , decayFunctionField  :: FieldName
+                } deriving (Eq, Show)
+
+data DecayFunctionName = Gauss | Exp | Linear
+  deriving (Eq, Show)
+newtype Origin =
+  Origin Text deriving (Eq, Show, FromJSON, ToJSON)
+newtype Scale =
+  Scale Text deriving (Eq, Show, FromJSON, ToJSON)
+newtype Offset =
+  Offset Text deriving (Eq, Show, FromJSON, ToJSON)
+newtype Decay =
+  Decay Double deriving (Eq, Show, FromJSON, ToJSON)
 
 newtype Weight =
   Weight Float deriving (Eq, Show, FromJSON, ToJSON)
@@ -135,6 +155,12 @@ functionScoreFunctionPair (FunctionScoreFunctionRandom seed) =
   ("random_score", omitNulls [ "seed" .= seed ])
 functionScoreFunctionPair (FunctionScoreFunctionFieldValueFactor fvf) =
   ("field_value_factor", toJSON fvf)
+functionScoreFunctionPair (FunctionScoreFunctionDecay Gauss decayFunc) =
+  ("gauss", toJSON decayFunc)
+functionScoreFunctionPair (FunctionScoreFunctionDecay Exp decayFunc) =
+  ("exp", toJSON decayFunc)
+functionScoreFunctionPair (FunctionScoreFunctionDecay Linear decayFunc) =
+  ("linear", toJSON decayFunc)
 
 parseFunctionScoreFunction :: Object -> Parser FunctionScoreFunction
 parseFunctionScoreFunction o =
@@ -218,3 +244,14 @@ instance FromJSON FactorModifier where
           parse "sqrt"       = pure FactorModifierSqrt
           parse "reciprocal" = pure FactorModifierReciprocal
           parse fm           = fail ("Unexpected FactorModifier: " <> show fm)
+
+instance ToJSON DecayFunction where
+  toJSON (DecayFunction origin scale offset decay (FieldName field)) =
+    object base
+    where base = [ field .= omitNulls
+                     [ "origin" .= origin
+                     , "scale"  .= scale
+                     , "offset" .= offset
+                     , "decay"  .= decay
+                     ]
+                 ]

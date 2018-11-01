@@ -200,6 +200,12 @@ module Database.V5.Bloodhound.Types
        , Factor(..)
        , FactorModifier(..)
        , FactorMissingFieldValue(..)
+       , DecayFunction(..)
+       , Origin(..)
+       , Scale(..)
+       , Offset(..)
+       , Decay(..)
+       , DecayFunctionName(..)
        , DisMaxQuery(..)
        , FuzzyLikeThisQuery(..)
        , FuzzyLikeFieldQuery(..)
@@ -417,15 +423,15 @@ module Database.V5.Bloodhound.Types
 
 import           Bloodhound.Import
 
-import           Database.V5.Bloodhound.Types.Class
-import           Database.V5.Bloodhound.Internal.Analysis
 import           Database.V5.Bloodhound.Internal.Aggregation
+import           Database.V5.Bloodhound.Internal.Analysis
 import           Database.V5.Bloodhound.Internal.Client
 import           Database.V5.Bloodhound.Internal.Highlight
 import           Database.V5.Bloodhound.Internal.Newtypes
 import           Database.V5.Bloodhound.Internal.Query
 import           Database.V5.Bloodhound.Internal.Sort
 import           Database.V5.Bloodhound.Internal.Suggest
+import           Database.V5.Bloodhound.Types.Class
 
 {-| 'unpackId' is a silly convenience function that gets used once.
 -}
